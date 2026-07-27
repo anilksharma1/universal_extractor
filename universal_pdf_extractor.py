@@ -4727,6 +4727,434 @@ def cmd_bucket11(args) -> int:
 
 
 # ===========================================================================
+# Interactive mode — tkinter format picker + per-PDF auto-detection
+#
+# Lets you pick one or more formats from a checkbox popup instead of typing a
+# subcommand; the script then sniffs each input PDF's text and only runs the
+# extractor(s) for the format(s) that actually match. Every run_*_on_file()
+# below is a single-file version of what its cmd_* counterpart already does
+# in a loop, reused here so there is one source of truth per format.
+# ===========================================================================
+
+try:
+    import tkinter as tk
+    from tkinter import filedialog, messagebox
+    HAS_TKINTER = True
+except ImportError:
+    HAS_TKINTER = False
+
+FORMAT_CHOICES = [
+    ("w2", "W-2 (employee identity + wage boxes)"),
+    ("1095c", "Form 1095-C (employee identity/address)"),
+    ("bucket11", "Payroll Changes (ADP Employee Payroll Changes)"),
+    ("401k", "401k (employee contribution data)"),
+    ("gross-pay", "Gross Pay (Employee Gross-To-Net report)"),
+    ("claims", "Claims / Remittance (patient identity, text-layer PDFs)"),
+    ("patient-info", "Patient Info (remittance PDFs, scanned or digital, OCR)"),
+    ("creditor-list", "Creditor List (bankruptcy mailing matrix)"),
+    ("generic", "Generic (fallback: any PDF, headers/tables/form fields)"),
+]
+FORMAT_LABELS = dict(FORMAT_CHOICES)
+FORMAT_PRIORITY = [key for key, _ in FORMAT_CHOICES]
+
+
+def sniff_pdf_text(pdf_path: Path, max_pages: int = 3):
+    """Return (lowercased sampled text, has_text_layer) for format detection."""
+    if not HAS_FITZ:
+        return "", False
+    try:
+        doc = fitz.open(pdf_path)
+    except Exception:
+        return "", False
+    parts = []
+    total_chars = 0
+    for i, page in enumerate(doc):
+        if i >= max_pages:
+            break
+        t = page.get_text()
+        parts.append(t)
+        total_chars += len(t.strip())
+    doc.close()
+    return "\n".join(parts).lower(), total_chars >= 40
+
+
+def _sniff_w2(text: str, has_text: bool) -> bool:
+    return bool(
+        "wage and tax statement" in text
+        or "wages, tips, other comp" in text
+        or re.search(r"employee.?s social security number", text)
+    )
+
+
+def _sniff_1095c(text: str, has_text: bool) -> bool:
+    return "1095-c" in text or "1095c" in text or "offer and coverage" in text
+
+
+def _sniff_bucket11(text: str, has_text: bool) -> bool:
+    return bool(
+        "employee payroll changes" in text
+        or ("changed field" in text and "changed from" in text and "changed to" in text)
+        or "associate id" in text
+    )
+
+
+def _sniff_401k(text: str, has_text: bool) -> bool:
+    return bool(re.search(r"401\s*\(?k\)?", text) or "elective deferral" in text)
+
+
+def _sniff_gross_pay(text: str, has_text: bool) -> bool:
+    return "gross to net" in text or ("ee id" in text and "employee name" in text and "ssn" in text)
+
+
+def _sniff_claims(text: str, has_text: bool) -> bool:
+    return has_text and ("health plan id" in text or "member totals" in text)
+
+
+def _sniff_patient_info(text: str, has_text: bool) -> bool:
+    return (not has_text) or "health plan id" in text or "member totals" in text or "patient acct" in text
+
+
+def _sniff_creditor_list(text: str, has_text: bool) -> bool:
+    return "mailing matrix" in text or "mailing list" in text or ("creditor" in text and "case no" in text)
+
+
+def _sniff_generic(text: str, has_text: bool) -> bool:
+    return True
+
+
+FORMAT_SNIFFERS = {
+    "w2": _sniff_w2,
+    "1095c": _sniff_1095c,
+    "bucket11": _sniff_bucket11,
+    "401k": _sniff_401k,
+    "gross-pay": _sniff_gross_pay,
+    "claims": _sniff_claims,
+    "patient-info": _sniff_patient_info,
+    "creditor-list": _sniff_creditor_list,
+    "generic": _sniff_generic,
+}
+
+
+def detect_format_for_file(pdf_path: Path, selected_formats: list) -> str:
+    """Return the best-matching format key among selected_formats for this
+    PDF, or None if none match. claims needs a real text layer to run at
+    all (it doesn't OCR); patient-info does OCR, so a scanned-only PDF is
+    tried against patient-info before claims."""
+    text, has_text = sniff_pdf_text(pdf_path)
+
+    order = list(FORMAT_PRIORITY)
+    if not has_text and "claims" in order and "patient-info" in order:
+        order.remove("patient-info")
+        order.insert(order.index("claims"), "patient-info")
+
+    for fmt in order:
+        if fmt not in selected_formats:
+            continue
+        if FORMAT_SNIFFERS[fmt](text, has_text):
+            return fmt
+    return None
+
+
+def find_any_template(folder: Path):
+    """Best-effort template auto-detect for interactive mode (1095c / gross-pay),
+    which don't prompt for a template path the way their CLI subcommands do."""
+    if not folder or not Path(folder).is_dir():
+        return None
+    candidates = [
+        p for p in Path(folder).glob("*.xlsx")
+        if not p.name.startswith("~$") and "template" in p.name.lower() and "_extracted" not in p.name.lower()
+    ]
+    return candidates[0] if len(candidates) == 1 else None
+
+
+# --- Per-file run wrappers: one call = one PDF, reusing each format's engine ---
+
+def run_w2_on_file(pdf_path: Path, output_dir, wages: bool = True) -> int:
+    records = w2_process_pdf(pdf_path, 0.5, wages)
+    if not records:
+        return 0
+    deduped = w2_dedupe_records(records)
+    columns = W2_CSV_COLUMNS + (W2_WAGE_COLUMNS if wages else [])
+    w2_write_workbook(deduped, _extracted_path(pdf_path, output_dir), columns)
+    return len(deduped)
+
+
+def run_1095c_on_file(pdf_path: Path, output_dir, template_path=None) -> int:
+    out_dir = Path(output_dir) if output_dir else pdf_path.parent
+    records = c1095_process_pdf(pdf_path, debug=False, output_dir=out_dir)
+    if not records:
+        return 0
+    c1095_build_workbook(records).save(_extracted_path(pdf_path, output_dir))
+    if template_path and Path(template_path).exists():
+        try:
+            c1095_build_template_workbook(template_path, records, pdf_path.name).save(
+                _extracted_path(pdf_path, output_dir, "_extracted_template.xlsx"))
+        except Exception as exc:
+            print(f"  [1095c] template-mapped output skipped for {pdf_path.name}: {exc}")
+    return len(records)
+
+
+def run_claims_on_file(pdf_path: Path, output_dir) -> int:
+    rows = claims_extract_pdf(pdf_path, debug=False, only_page=None)
+    if not rows:
+        return 0
+    try:
+        claims_build_workbook(rows).save(_extracted_path(pdf_path, output_dir))
+    except PermissionError:
+        print(f"  [claims] could not write output for {pdf_path.name} -- file may be open")
+        return 0
+    return len(rows)
+
+
+def run_patient_info_on_file(pdf_path: Path, output_dir) -> int:
+    if not HAS_OCR:
+        print(f"  [patient-info] skipped {pdf_path.name} -- pytesseract/pillow not installed")
+        return 0
+    out_dir = Path(output_dir) if output_dir else pdf_path.parent
+    out_dir.mkdir(parents=True, exist_ok=True)
+    searchable_path = out_dir / f"{pdf_path.stem}_searchable.pdf"
+    if not searchable_path.exists():
+        patient_make_searchable_pdf(pdf_path, searchable_path)
+    text, page_offsets = patient_extract_pdf_text(searchable_path)
+    rows = patient_extract_format_b(text, page_offsets) + patient_extract_format_a(text, page_offsets)
+    rows = patient_merge_same_patient(rows)
+    if not rows:
+        return 0
+    patient_build_workbook(rows).save(_extracted_path(pdf_path, output_dir))
+    return len(rows)
+
+
+def run_gross_pay_on_file(pdf_path: Path, output_dir, template_path=None) -> int:
+    records = gp_process_pdf(pdf_path)
+    if not records:
+        return 0
+    for r in records:
+        r["Doc ID"] = pdf_path.name
+    gp_build_extracted_workbook(records).save(_extracted_path(pdf_path, output_dir))
+    if template_path and Path(template_path).exists():
+        try:
+            gp_build_template_workbook(template_path, records).save(
+                _extracted_path(pdf_path, output_dir, "_extracted_template.xlsx"))
+        except Exception as exc:
+            print(f"  [gross-pay] template-mapped output skipped for {pdf_path.name}: {exc}")
+    return len(records)
+
+
+def run_401k_on_file(pdf_path: Path, output_dir, template_path=None) -> int:
+    records = k401_extract(pdf_path, pdf_path.stem)
+    k401_write_workbook(_extracted_path(pdf_path, output_dir), records,
+                         Path(template_path) if template_path else None)
+    return len(records)
+
+
+def run_creditor_list_on_file(pdf_path: Path, output_dir) -> int:
+    entries = creditor_extract_pdf(pdf_path)
+    if not entries:
+        return 0
+    creditor_write_workbook(_extracted_path(pdf_path, output_dir), entries)
+    return len(entries)
+
+
+def run_generic_on_file(pdf_path: Path, output_dir) -> int:
+    sections, tables, form_fields = generic_extract_pdf(pdf_path)
+    generic_write_workbook(_extracted_path(pdf_path, output_dir), sections, tables, form_fields)
+    return len(sections) + sum(len(t["rows"]) for t in tables) + len(form_fields)
+
+
+def run_bucket11_on_file(pdf_path: Path, output_dir, template_headers=None, template_tags=None, bucket11_headers=None) -> int:
+    change_rows, warning, _pages = b11_extract_changes(pdf_path, debug=False)
+    for rec in change_rows:
+        rec["DOCID"] = pdf_path.name
+    b11_write_per_pdf_output(_extracted_path(pdf_path, output_dir), change_rows, warning,
+                              template_headers, template_tags, bucket11_headers)
+    return len(change_rows)
+
+
+def run_detected_format(fmt: str, pdf_path: Path, output_dir, resolved_templates: dict) -> int:
+    if fmt == "w2":
+        return run_w2_on_file(pdf_path, output_dir)
+    if fmt == "1095c":
+        return run_1095c_on_file(pdf_path, output_dir, resolved_templates.get("1095c"))
+    if fmt == "claims":
+        return run_claims_on_file(pdf_path, output_dir)
+    if fmt == "patient-info":
+        return run_patient_info_on_file(pdf_path, output_dir)
+    if fmt == "gross-pay":
+        return run_gross_pay_on_file(pdf_path, output_dir, resolved_templates.get("gross-pay"))
+    if fmt == "401k":
+        return run_401k_on_file(pdf_path, output_dir, resolved_templates.get("401k"))
+    if fmt == "creditor-list":
+        return run_creditor_list_on_file(pdf_path, output_dir)
+    if fmt == "generic":
+        return run_generic_on_file(pdf_path, output_dir)
+    if fmt == "bucket11":
+        tmpl = resolved_templates.get("bucket11") or (None, None, None)
+        return run_bucket11_on_file(pdf_path, output_dir, *tmpl)
+    return 0
+
+
+def resolve_templates_for_formats(selected_formats: list, search_dir: Path) -> dict:
+    """Best-effort, non-fatal template auto-detection per format, run once
+    per interactive session rather than per file."""
+    resolved = {}
+    script_dir = Path(__file__).parent
+
+    if "1095c" in selected_formats or "gross-pay" in selected_formats:
+        tmpl = find_any_template(search_dir)
+        if "1095c" in selected_formats:
+            resolved["1095c"] = tmpl
+        if "gross-pay" in selected_formats:
+            resolved["gross-pay"] = tmpl
+
+    if "401k" in selected_formats:
+        candidates = [script_dir / "Latest Template.xlsx", search_dir / "Latest Template.xlsx"]
+        resolved["401k"] = next((p for p in candidates if p.exists()), None)
+
+    if "bucket11" in selected_formats:
+        tmpl_path = script_dir / "Latest Template.xlsx"
+        bl_path = script_dir / "Bucket_11_List.xlsx"
+        if tmpl_path.exists() and bl_path.exists():
+            headers, tags = b11_load_template(tmpl_path)
+            b11_headers = b11_load_bucket11_headers(bl_path)
+            resolved["bucket11"] = (headers, tags, b11_headers)
+        else:
+            resolved["bucket11"] = (None, None, None)
+
+    return resolved
+
+
+def run_interactive_dispatch(selected_formats: list, input_path: Path, output_dir) -> None:
+    pdf_files = list(_iter_pdfs(input_path, recursive=True)) if input_path.is_dir() else [input_path]
+    if not pdf_files:
+        print(f"No PDF files found at: {input_path}")
+        return
+
+    search_dir = input_path if input_path.is_dir() else input_path.parent
+    resolved_templates = resolve_templates_for_formats(selected_formats, search_dir)
+
+    print(f"Selected format(s): {', '.join(FORMAT_LABELS[f] for f in selected_formats)}")
+    print(f"Found {len(pdf_files)} PDF file(s). Detecting format per file...\n")
+
+    counts = defaultdict(int)
+    unmatched = []
+
+    for pdf_path in tqdm(pdf_files, desc="Processing", unit="file"):
+        fmt = detect_format_for_file(pdf_path, selected_formats)
+        if fmt is None:
+            unmatched.append(pdf_path.name)
+            continue
+        try:
+            n = run_detected_format(fmt, pdf_path, output_dir, resolved_templates)
+        except Exception as exc:
+            print(f"  [{fmt}] ERROR on {pdf_path.name}: {exc}")
+            continue
+        counts[fmt] += 1
+        print(f"  {pdf_path.name} -> detected as [{FORMAT_LABELS[fmt]}] -- {n} record(s)")
+
+    print("\nSummary:")
+    for fmt in selected_formats:
+        if counts[fmt]:
+            print(f"  {FORMAT_LABELS[fmt]}: {counts[fmt]} file(s) processed")
+    if unmatched:
+        print(f"  Skipped (no selected format matched): {len(unmatched)} file(s)")
+        for name in unmatched:
+            print(f"    - {name}")
+
+
+def launch_format_picker():
+    """Tkinter checkbox popup. Returns (selected_formats, input_path, output_dir)
+    or None if the user cancelled."""
+    if not HAS_TKINTER:
+        print("ERROR: tkinter is not available in this Python installation.")
+        return None
+
+    result = {}
+
+    root = tk.Tk()
+    root.title("Universal PDF Extractor")
+    root.resizable(False, False)
+
+    tk.Label(root, text="Select document format(s) to detect and extract:",
+             font=("Segoe UI", 10, "bold")).grid(row=0, column=0, columnspan=3, sticky="w", padx=10, pady=(10, 4))
+
+    vars_by_format = {}
+    for i, (key, label) in enumerate(FORMAT_CHOICES):
+        var = tk.BooleanVar(value=False)
+        tk.Checkbutton(root, text=label, variable=var).grid(row=1 + i, column=0, columnspan=3, sticky="w", padx=20)
+        vars_by_format[key] = var
+
+    row_after_formats = 1 + len(FORMAT_CHOICES)
+
+    tk.Label(root, text="Input (PDF file or folder):").grid(row=row_after_formats, column=0, sticky="w", padx=10, pady=(10, 2))
+    input_var = tk.StringVar()
+    tk.Entry(root, textvariable=input_var, width=48).grid(row=row_after_formats + 1, column=0, columnspan=2, sticky="w", padx=10)
+
+    def choose_file():
+        path = filedialog.askopenfilename(title="Choose a PDF file", filetypes=[("PDF files", "*.pdf")])
+        if path:
+            input_var.set(path)
+
+    def choose_folder():
+        path = filedialog.askdirectory(title="Choose a folder of PDFs")
+        if path:
+            input_var.set(path)
+
+    tk.Button(root, text="File...", command=choose_file).grid(row=row_after_formats + 1, column=2, padx=4)
+    tk.Button(root, text="Folder...", command=choose_folder).grid(row=row_after_formats + 1, column=3, padx=4)
+
+    tk.Label(root, text="Output folder (optional; default: alongside each PDF):").grid(
+        row=row_after_formats + 2, column=0, columnspan=3, sticky="w", padx=10, pady=(10, 2))
+    output_var = tk.StringVar()
+    tk.Entry(root, textvariable=output_var, width=48).grid(row=row_after_formats + 3, column=0, columnspan=2, sticky="w", padx=10)
+
+    def choose_output():
+        path = filedialog.askdirectory(title="Choose an output folder")
+        if path:
+            output_var.set(path)
+
+    tk.Button(root, text="Folder...", command=choose_output).grid(row=row_after_formats + 3, column=2, padx=4)
+
+    def on_run():
+        selected = [k for k, v in vars_by_format.items() if v.get()]
+        if not selected:
+            messagebox.showerror("Universal PDF Extractor", "Select at least one format.")
+            return
+        if not input_var.get().strip():
+            messagebox.showerror("Universal PDF Extractor", "Choose an input PDF file or folder.")
+            return
+        if not Path(input_var.get().strip()).exists():
+            messagebox.showerror("Universal PDF Extractor", "That input path does not exist.")
+            return
+        result["formats"] = selected
+        result["input"] = input_var.get().strip()
+        result["output"] = output_var.get().strip() or None
+        root.destroy()
+
+    def on_cancel():
+        root.destroy()
+
+    btn_row = row_after_formats + 4
+    tk.Button(root, text="Run", command=on_run, width=12).grid(row=btn_row, column=0, padx=10, pady=12, sticky="w")
+    tk.Button(root, text="Cancel", command=on_cancel, width=12).grid(row=btn_row, column=1, pady=12, sticky="w")
+
+    root.mainloop()
+
+    if not result:
+        return None
+    return result["formats"], result["input"], result["output"]
+
+
+def cmd_interactive(args) -> int:
+    picked = launch_format_picker()
+    if picked is None:
+        print("Cancelled -- no formats/input selected.")
+        return 0
+    selected_formats, input_str, output_dir = picked
+    run_interactive_dispatch(selected_formats, Path(input_str), output_dir)
+    return 0
+
+
+# ===========================================================================
 # CLI dispatch
 # ===========================================================================
 
@@ -4746,6 +5174,9 @@ def build_parser() -> argparse.ArgumentParser:
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     sub = parser.add_subparsers(dest="command", required=True)
+
+    p = sub.add_parser("interactive", help="Open a checkbox popup to pick format(s); auto-detects each PDF's format")
+    p.set_defaults(func=cmd_interactive)
 
     p = sub.add_parser("w2", help="Extract Employee Name/Address/SSN (+ optional wage boxes) from W-2 PDFs")
     p.add_argument("input", help="PDF file or folder of PDFs")
@@ -4819,6 +5250,10 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main() -> int:
+    if len(sys.argv) == 1:
+        # No subcommand given -- launch the interactive format picker rather
+        # than argparse erroring out with "the following arguments are required".
+        return cmd_interactive(None)
     parser = build_parser()
     args = parser.parse_args()
     return args.func(args)
