@@ -1,23 +1,12 @@
-# w2_wages_extractor.py
-# Extracts Employee Name, SSN, Address, AND wage/tax box amounts from W-2 PDF files.
-# Based on w2_extractor.py — adds Box 1–6 amount extraction.
-# In batch mode, all PDFs are combined into ONE output Excel file.
+# w2_extractor.py
+# Extracts Employee Name, SSN, and Address from all pages of
+# W-2 PDF files (ADP layout and standard IRS layouts).
+# Uses coordinate-based word extraction for accurate field detection.
+# Returns one row per employee per page. If extraction is wrong, run with --debug first.
 #
-# Extracted W-2 boxes:
-#   Box 1  — Wages, Tips, Other Compensation
-#   Box 2  — Federal Income Tax Withheld
-#   Box 3  — Social Security Wages
-#   Box 4  — Social Security Tax Withheld
-#   Box 5  — Medicare Wages and Tips
-#   Box 6  — Medicare Tax Withheld
-#
-# Outputs (batch mode — single combined file):
-#   <dest>/<output>.xlsx          — "Extracted Data" + "Standardized Data" sheets
-#   <dest>/<output>_processing.xlsx — per-document summary
-#
-# Outputs (single file mode):
-#   <dest>/<pdf_stem>.xlsx
-#   <dest>/<pdf_stem>_processing.xlsx
+# Outputs:
+#   <output>.xlsx          — two sheets: "Extracted Data" + "Standardized Data"
+#   <output>_processing.xlsx — per-document summary (entity count, SSN count, etc.)
 #
 # Requires: pdfplumber, pandas, openpyxl, tqdm
 #   pip install pdfplumber pandas openpyxl tqdm
@@ -26,19 +15,22 @@
 # USAGE
 # ---------------------------------------------------------------------------
 #
-# Debug mode — print raw word positions from first page:
+# Debug mode — print raw word positions pdfplumber reads from the first page.
 #
-#   python w2_wages_extractor.py "C:\YourFolder\sample_w2.pdf" --debug
+#   python w2_extractor.py "C:\YourFolder\sample_w2.pdf" --debug
 #
-# Single file:
+# Single file extraction:
 #
-#   python w2_wages_extractor.py "C:\YourFolder\sample_w2.pdf"
-#   python w2_wages_extractor.py "C:\YourFolder\sample_w2.pdf" "C:\Output\results.xlsx"
+#   python w2_extractor.py "C:\YourFolder\sample_w2.pdf"
+#   python w2_extractor.py "C:\YourFolder\sample_w2.pdf" "C:\Output\results.xlsx"
 #
-# Batch folder (all PDFs → ONE combined Excel):
+# Batch folder extraction (all PDFs in a directory):
 #
-#   python w2_wages_extractor.py "C:\YourFolder\PDFs\" "C:\Output\results.xlsx"
-#   python w2_wages_extractor.py "C:\YourFolder\PDFs\" "C:\Output\" --pages 10
+#   python w2_extractor.py "C:\YourFolder\PDFs\" "C:\Output\results.xlsx"
+#
+# Limit pages per file:
+#
+#   python w2_extractor.py "C:\YourFolder\sample_w2.pdf" --pages 10
 #
 # ---------------------------------------------------------------------------
 # DO NOT commit real W-2 documents or any file containing PII as test data.
@@ -59,46 +51,35 @@ from tqdm import tqdm
 # Regex patterns
 # ---------------------------------------------------------------------------
 
+# SSN: XXX-XX-XXXX (not EIN format XX-XXXXXXX)
 _SSN_PATTERN = re.compile(r"^\d{3}-\d{2}-\d{4}$")
 _SSN_IN_LINE = re.compile(r"\b(\d{3}-\d{2}-\d{4})\b")
-_CITY_STATE_ZIP_RE = re.compile(r"^.+,?\s+[A-Z]{2}\s+\d{5}(?:-\d{4})?\s*$")
-_ZIP_RE = re.compile(r"\b\d{5}(?:-\d{4})?\b")
 
-# Dollar amount: optional $, digits with commas, optional decimal
-_AMOUNT_RE = re.compile(r"\$?\s*(\d{1,3}(?:,\d{3})*(?:\.\d{1,2})?|\d+(?:\.\d{1,2})?)")
+# City, ST ZIP pattern
+_CITY_STATE_ZIP_RE = re.compile(r"^.+,?\s+[A-Z]{2}\s+\d{5}(?:-\d{4})?\s*$")
+
+# US ZIP / ZIP+4
+_ZIP_RE = re.compile(r"\b\d{5}(?:-\d{4})?\b")
 
 
 # ---------------------------------------------------------------------------
 # Layout constants (tuned for ADP W-2 layout)
+# The 'e/f' block label sits at top < 280 and x0 < 60
 # ---------------------------------------------------------------------------
 
 _EF_LABEL_MAX_Y = 280
 _EF_LABEL_MAX_X = 60
-_SSN_OFFSET_MIN = 30
+_SSN_OFFSET_MIN = 30   # points below e/f label where SSN appears
 _SSN_OFFSET_MAX = 80
-_BOTTOM_ROW_Y_MIN = 450
+_BOTTOM_ROW_Y_MIN = 450  # SSNs below this are employer copies — ignore
 
 
 # ---------------------------------------------------------------------------
-# Wage box labels — the text that appears ON the W-2 form near each box
-# ---------------------------------------------------------------------------
-
-# Each entry: (box_number, list of label substrings to match, case-insensitive)
-_WAGE_BOX_DEFS = [
-    ("box1_wages",    ["wages, tips, other comp", "wages, tips, other", "1 wages"]),
-    ("box2_fed_tax",  ["federal income tax withheld", "fed income tax", "2 federal"]),
-    ("box3_ss_wages", ["social security wages", "3 social security wages", "ss wages"]),
-    ("box4_ss_tax",   ["social security tax withheld", "4 social security tax", "ss tax withheld"]),
-    ("box5_med_wages",["medicare wages and tips", "5 medicare wages", "medicare wages"]),
-    ("box6_med_tax",  ["medicare tax withheld", "6 medicare tax", "medicare tax"]),
-]
-
-
-# ---------------------------------------------------------------------------
-# Coordinate-based employee block extraction (unchanged from w2_extractor.py)
+# Coordinate-based extraction (primary path — matches extract_w2_gui.py logic)
 # ---------------------------------------------------------------------------
 
 def _find_ef_blocks(words: list) -> list:
+    """Return position dicts for each 'e/f' label found in the top region of the page."""
     blocks = []
     for w in words:
         if w["top"] > _EF_LABEL_MAX_Y:
@@ -112,6 +93,11 @@ def _find_ef_blocks(words: list) -> list:
 
 
 def _extract_employee_from_block(words: list, label_top: float, label_x0: float) -> dict | None:
+    """
+    Given the position of an 'e/f' label, extract name/street/city-state-zip
+    from the 3 lines below it, and the SSN from the area further below.
+    """
+    # Words in the ~35pt window below the label, within the left column
     block_words = [
         w for w in words
         if label_top + 2 < w["top"] < label_top + 35
@@ -120,6 +106,7 @@ def _extract_employee_from_block(words: list, label_top: float, label_x0: float)
     ]
     block_words.sort(key=lambda w: (w["top"], w["x0"]))
 
+    # Group into visual lines by proximity of 'top' coordinate
     lines = []
     LINE_TOL = 4
     for w in block_words:
@@ -141,6 +128,7 @@ def _extract_employee_from_block(words: list, label_top: float, label_x0: float)
     if len(text_lines) < 2:
         return None
 
+    # Find SSN in the y-offset band below the block label
     ssn_candidates = []
     for w in words:
         if label_top + _SSN_OFFSET_MIN < w["top"] < label_top + _SSN_OFFSET_MAX:
@@ -149,6 +137,7 @@ def _extract_employee_from_block(words: list, label_top: float, label_x0: float)
                 if m and _SSN_PATTERN.match(m.group(1)):
                     ssn_candidates.append(m.group(1))
 
+    # Fallback: search full text of that region (handles fused tokens)
     if not ssn_candidates:
         region_words = [
             w for w in words
@@ -162,6 +151,7 @@ def _extract_employee_from_block(words: list, label_top: float, label_x0: float)
 
     ssn = ssn_candidates[0] if ssn_candidates else ""
 
+    # Identify city/state/zip line, work backward for name and street
     name = street = csz = ""
     csz_idx = -1
     for i, ln in enumerate(text_lines):
@@ -171,6 +161,7 @@ def _extract_employee_from_block(words: list, label_top: float, label_x0: float)
             break
 
     if csz_idx == -1:
+        # Positional fallback when no city/state/zip pattern matched
         if len(text_lines) >= 1:
             name = text_lines[0]
         if len(text_lines) >= 2:
@@ -192,95 +183,12 @@ def _extract_employee_from_block(words: list, label_top: float, label_x0: float)
 
 
 # ---------------------------------------------------------------------------
-# Wage amount extraction — text-based, scans the full page text
-# ---------------------------------------------------------------------------
-
-def _parse_amount(text: str) -> str:
-    """Return the first dollar amount found in text, or empty string."""
-    m = _AMOUNT_RE.search(text)
-    if m:
-        raw = m.group(1).replace(",", "")
-        try:
-            return f"{float(raw):.2f}"
-        except ValueError:
-            return ""
-    return ""
-
-
-def _extract_wages_from_text(page_text: str) -> dict:
-    """
-    Scan page text for W-2 wage/tax boxes.
-    Returns a dict keyed by the box field names in _WAGE_BOX_DEFS.
-    Strategy: find the label line, then look at the same line or the next line
-    for the dollar amount.
-    """
-    lines = page_text.splitlines()
-    results = {key: "" for key, _ in _WAGE_BOX_DEFS}
-
-    for box_key, label_list in _WAGE_BOX_DEFS:
-        for i, line in enumerate(lines):
-            line_lower = line.lower()
-            matched = any(lbl in line_lower for lbl in label_list)
-            if not matched:
-                continue
-
-            # Try to find amount on the same line (after the label)
-            amount = _parse_amount(line)
-            if not amount and i + 1 < len(lines):
-                # Try the next line
-                amount = _parse_amount(lines[i + 1])
-            if amount:
-                results[box_key] = amount
-                break
-
-    return results
-
-
-def _extract_wages_from_words(words: list) -> dict:
-    """
-    Coordinate-aware wage extraction.
-    For each wage box label found, look for a nearby amount word to the right or below.
-    Falls back gracefully — used to supplement _extract_wages_from_text.
-    """
-    results = {key: "" for key, _ in _WAGE_BOX_DEFS}
-
-    # Build a joined string per Y-band to find label positions
-    LINE_TOL = 6
-
-    def words_near(target_top: float, x_min: float = 0, x_max: float = 9999,
-                   y_slack: float = 20) -> list:
-        return [
-            w for w in words
-            if abs(w["top"] - target_top) <= y_slack
-            and x_min <= w["x0"] <= x_max
-        ]
-
-    for box_key, label_list in _WAGE_BOX_DEFS:
-        if results[box_key]:
-            continue
-        for w in words:
-            text_lower = w["text"].lower()
-            if any(lbl in text_lower for lbl in label_list):
-                # Amount typically appears to the right of the label on the same line
-                nearby = words_near(w["top"], x_min=w["x1"], y_slack=LINE_TOL)
-                nearby.sort(key=lambda ww: ww["x0"])
-                for cand in nearby:
-                    amt = _parse_amount(cand["text"])
-                    if amt:
-                        results[box_key] = amt
-                        break
-                break
-
-    return results
-
-
-# ---------------------------------------------------------------------------
-# Text-based fallback for employee identity (unchanged from w2_extractor.py)
+# Text-based fallback (for PDFs where coordinate extraction finds nothing)
 # ---------------------------------------------------------------------------
 
 _SSN_RE_LOOSE = re.compile(r"\b(\d{3}[-\s]\d{2}[-\s]\d{4})\b")
-_ZIP_RE_TEXT  = re.compile(r"\b\d{5}(?:-\d{4})?\b")
-_NAME_RE      = re.compile(r"\b([A-Z][a-zA-Z\-']+(?:\s+[A-Z][a-zA-Z\-']*){1,4})\b")
+_ZIP_RE_TEXT = re.compile(r"\b\d{5}(?:-\d{4})?\b")
+_NAME_RE = re.compile(r"\b([A-Z][a-zA-Z\-']+(?:\s+[A-Z][a-zA-Z\-']*){1,4})\b")
 
 _NON_NAME_WORDS = {
     "EARNINGS", "SUMMARY", "WAGES", "TIPS", "COMPENSATION", "FEDERAL", "STATE",
@@ -320,8 +228,10 @@ def _extract_name_from_text(block: str) -> str:
 
 
 def _text_fallback(page_text: str) -> dict:
+    """Text-based extraction used when coordinate method yields no results."""
     lines = [ln for ln in page_text.splitlines() if ln.strip()]
 
+    # SSN
     ssn = ""
     for line in lines:
         norm = line.lower().strip()
@@ -337,6 +247,7 @@ def _text_fallback(page_text: str) -> dict:
         m = _SSN_RE_LOOSE.search(page_text)
         ssn = m.group(1) if m else ""
 
+    # Name + address via e/f label
     name = street = csz = ""
     for i, line in enumerate(lines):
         norm = line.lower().strip()
@@ -356,17 +267,17 @@ def _text_fallback(page_text: str) -> dict:
 
 
 # ---------------------------------------------------------------------------
-# Core page extraction
+# Core page extraction — coordinate-based primary, text fallback
 # ---------------------------------------------------------------------------
 
-def _extract_page(words: list, page_text: str) -> list[dict]:
+def _extract_page_words(words: list, page_text: str) -> list[dict]:
     """
-    Extract all employee records + wage amounts from a page.
-    Returns list of dicts, one per employee found.
+    Extract all employee records from a page.
+    Returns a list of dicts (one per employee found).
+    Uses coordinate-based extraction; falls back to text if nothing found.
     """
-    # Employee identity (coordinate-based primary)
     blocks = _find_ef_blocks(words)
-    id_records = []
+    records = []
     seen_ssns: set = set()
     seen_keys: set = set()
 
@@ -386,32 +297,17 @@ def _extract_page(words: list, page_text: str) -> list[dict]:
         seen_keys.add(key)
 
         address_parts = [p for p in [result["street"], result["city_state_zip"]] if p]
-        id_records.append({
+        records.append({
             "EmployeeName": result["name"],
             "SSN": result["ssn"],
             "Address": ", ".join(address_parts),
         })
 
-    if not id_records and page_text.strip():
+    # If coordinate extraction found nothing, use text fallback
+    if not records and page_text.strip():
         fb = _text_fallback(page_text)
         if fb["EmployeeName"] or fb["SSN"]:
-            id_records.append(fb)
-
-    if not id_records:
-        return []
-
-    # Wage amounts — extract once per page, apply to all records on the page
-    wages_coord = _extract_wages_from_words(words)
-    wages_text  = _extract_wages_from_text(page_text)
-
-    # Merge: coordinate result wins if present, otherwise text result
-    wages = {}
-    for box_key, _ in _WAGE_BOX_DEFS:
-        wages[box_key] = wages_coord.get(box_key) or wages_text.get(box_key) or ""
-
-    records = []
-    for rec in id_records:
-        records.append({**rec, **wages})
+            records.append(fb)
 
     return records
 
@@ -422,13 +318,22 @@ def _extract_page(words: list, page_text: str) -> list[dict]:
 
 _NAME_SUFFIXES = {"JR", "JR.", "SR", "SR.", "II", "III", "IV", "V", "ESQ", "ESQ."}
 
+# "CITY STATE ZIP"  e.g. "PLEASANTON CA 94566-4477"
 _CSZ_RE = re.compile(
     r"^(?P<city>.+?),?\s+(?P<state>[A-Z]{2})\s+(?P<zip>\d{5}(?:-\d{4})?)\s*$"
 )
+# "STATE ZIP"  e.g. "WI 53923"  (city is a separate comma-segment)
 _STATE_ZIP_RE = re.compile(r"^(?P<state>[A-Z]{2})\s+(?P<zip>\d{5}(?:-\d{4})?)\s*$")
 
 
 def _split_name(full_name: str) -> dict:
+    """
+    Split a full name string into First, Middle, Last, Suffix.
+
+    Handles ALL-CAPS W-2 names like "JOHN MICHAEL DOE JR" or "SMITH JANE A".
+    W-2 names are sometimes stored Last-First, but we treat the raw order as-is
+    (first token = first name) since ADP stores them First-Last.
+    """
     tokens = full_name.strip().split()
     suffix = ""
     if tokens and tokens[-1].upper() in _NAME_SUFFIXES:
@@ -441,6 +346,8 @@ def _split_name(full_name: str) -> dict:
         return {"FirstName": tokens[0], "MiddleName": "", "LastName": "", "Suffix": suffix}
     if len(tokens) == 2:
         return {"FirstName": tokens[0], "MiddleName": "", "LastName": tokens[1], "Suffix": suffix}
+
+    # 3+ tokens: first / middle(s) / last
     return {
         "FirstName":  tokens[0],
         "MiddleName": " ".join(tokens[1:-1]),
@@ -450,12 +357,20 @@ def _split_name(full_name: str) -> dict:
 
 
 def _split_address(address: str) -> dict:
+    """
+    Split a combined address string into StreetAddress, City, State, ZipCode.
+
+    Handles two formats:
+        "519 TRADITION PKWY 4200, PLEASANTON CA 94566-4477"  -> 2-part (city+state+zip fused)
+        "801 W. COMMERCE ST UNIT 12, CAMBRIA, WI 53923"      -> 3-part (city and state+zip separate)
+    """
     parts = [p.strip() for p in address.split(",") if p.strip()]
     street = city = state = zip_code = ""
 
     if not parts:
         return {"StreetAddress": street, "City": city, "State": state, "ZipCode": zip_code}
 
+    # Format A: last segment is "STATE ZIP"  e.g. "WI 53923"
     m = _STATE_ZIP_RE.match(parts[-1])
     if m:
         state    = m.group("state")
@@ -464,6 +379,7 @@ def _split_address(address: str) -> dict:
         street   = ", ".join(parts[:-2])
         return {"StreetAddress": street, "City": city, "State": state, "ZipCode": zip_code}
 
+    # Format B: last segment is "CITY STATE ZIP"  e.g. "PLEASANTON CA 94566-4477"
     m = _CSZ_RE.match(parts[-1])
     if m:
         city     = m.group("city").strip()
@@ -472,13 +388,15 @@ def _split_address(address: str) -> dict:
         street   = ", ".join(parts[:-1])
         return {"StreetAddress": street, "City": city, "State": state, "ZipCode": zip_code}
 
+    # Fallback: return the whole string as street
     return {"StreetAddress": address, "City": city, "State": state, "ZipCode": zip_code}
 
 
 # ---------------------------------------------------------------------------
-# Standardized output columns
+# Standardized output builders
 # ---------------------------------------------------------------------------
 
+# Full column list matching the template (blank columns filled with "")
 _STD_COLUMNS = [
     "Document Id", "Document",
     "First Name", "Middle Name", "Last Name", "Suffix",
@@ -495,29 +413,14 @@ _STD_COLUMNS = [
     "Date of Service", "Medical Record Number", "Medical History",
     "Diagnosis/Condition", "Hospital/Facility",
     "Patient Account Number", "Biometric ID", "Vehicle Identification Number",
-    # Wage fields appended after the standard template columns
-    "Box 1 Wages Tips Other Comp",
-    "Box 2 Federal Tax Withheld",
-    "Box 3 SS Wages",
-    "Box 4 SS Tax Withheld",
-    "Box 5 Medicare Wages",
-    "Box 6 Medicare Tax Withheld",
 ]
-
-_BOX_KEY_TO_STD = {
-    "box1_wages":     "Box 1 Wages Tips Other Comp",
-    "box2_fed_tax":   "Box 2 Federal Tax Withheld",
-    "box3_ss_wages":  "Box 3 SS Wages",
-    "box4_ss_tax":    "Box 4 SS Tax Withheld",
-    "box5_med_wages": "Box 5 Medicare Wages",
-    "box6_med_tax":   "Box 6 Medicare Tax Withheld",
-}
 
 
 def _build_standardized_df(raw_df: pd.DataFrame) -> pd.DataFrame:
+    """Convert the raw extracted DataFrame into the standardized template layout."""
     rows = []
     for _, row in raw_df.iterrows():
-        doc_id   = Path(row["File"]).stem
+        doc_id   = Path(row["File"]).stem          # filename without extension
         doc_name = row["File"]
 
         name_parts = _split_name(row.get("EmployeeName", "") or "")
@@ -536,16 +439,18 @@ def _build_standardized_df(raw_df: pd.DataFrame) -> pd.DataFrame:
         std_row["State"]                  = addr_parts["State"]
         std_row["Zip Code"]               = addr_parts["ZipCode"]
         std_row["Social Security Number"] = row.get("SSN", "")
-
-        for box_key, col_name in _BOX_KEY_TO_STD.items():
-            std_row[col_name] = row.get(box_key, "")
-
         rows.append(std_row)
 
     return pd.DataFrame(rows, columns=_STD_COLUMNS)
 
 
 def _build_processing_summary(frames_info: list) -> pd.DataFrame:
+    """
+    Build a per-document processing summary.
+
+    frames_info — list of dicts:
+        file, pages_processed, records, ssn_count, status, error
+    """
     summary_rows = []
     for info in frames_info:
         doc_id = Path(info["file"]).stem
@@ -557,7 +462,6 @@ def _build_processing_summary(frames_info: list) -> pd.DataFrame:
             "SSN Count":        info["ssn_count"],
             "Names Found":      info["names_found"],
             "Addresses Found":  info["addresses_found"],
-            "Wages Found":      info["wages_found"],
             "Status":           info["status"],
             "Error":            info.get("error", ""),
         })
@@ -565,16 +469,17 @@ def _build_processing_summary(frames_info: list) -> pd.DataFrame:
 
 
 # ---------------------------------------------------------------------------
-# Excel writer
+# Excel writer — two sheets in one file + separate processing summary
 # ---------------------------------------------------------------------------
 
 def _save_excel(raw_df: pd.DataFrame, output_path: str,
                 summary_df: pd.DataFrame | None = None) -> None:
     """
     Write output_path.xlsx with two sheets:
-        "Extracted Data"    — raw fields including wage boxes
+        "Extracted Data"   — raw fields (File, Page, EmployeeName, SSN, Address)
         "Standardized Data" — template-formatted fields
-    Also writes <stem>_processing.xlsx alongside it.
+
+    Also writes <stem>_processing.xlsx alongside it with the document summary.
     """
     out = Path(output_path).with_suffix(".xlsx")
     std_df = _build_standardized_df(raw_df)
@@ -583,7 +488,8 @@ def _save_excel(raw_df: pd.DataFrame, output_path: str,
         raw_df.to_excel(writer, sheet_name="Extracted Data", index=False)
         std_df.to_excel(writer, sheet_name="Standardized Data", index=False)
 
-    print(f"  Excel saved: {out.name}  ({len(raw_df)} record(s), 2 sheets)")
+    print(f"  Excel saved: {out.name}  "
+          f"({len(raw_df)} record(s), 2 sheets)")
 
     if summary_df is not None and not summary_df.empty:
         proc_path = out.parent / f"{out.stem}_processing.xlsx"
@@ -592,28 +498,23 @@ def _save_excel(raw_df: pd.DataFrame, output_path: str,
         print(f"  Processing summary: {proc_path.name}")
 
 
-# ---------------------------------------------------------------------------
-# Per-file extraction
-# ---------------------------------------------------------------------------
-
-_RAW_COLS = [
-    "File", "Page", "EmployeeName", "SSN", "Address",
-    "box1_wages", "box2_fed_tax", "box3_ss_wages",
-    "box4_ss_tax", "box5_med_wages", "box6_med_tax",
-]
-
-
 def extract_w2(file_path: str, max_pages: int = 0) -> tuple[pd.DataFrame, dict]:
     """
-    Extract employee identity + wage box amounts from a W-2 PDF.
+    Extract Employee Name, SSN, and Address from a W-2 or Earnings Summary PDF.
+
+    Parameters
+    ----------
+    file_path : str
+        Path to the PDF file.
+    max_pages : int
+        Maximum number of pages to process. 0 (default) means all pages.
 
     Returns
     -------
     (DataFrame, info_dict)
-        DataFrame columns: File, Page, EmployeeName, SSN, Address,
-                           box1_wages ... box6_med_tax.
+        DataFrame columns: File, Page, EmployeeName, SSN, Address.
         info_dict: file, pages_processed, records, ssn_count, names_found,
-                   addresses_found, wages_found, status, error.
+                   addresses_found, status, error.
     """
     path = Path(file_path)
     if not path.exists():
@@ -645,25 +546,16 @@ def extract_w2(file_path: str, max_pages: int = 0) -> tuple[pd.DataFrame, dict]:
                 words = []
             page_text = page.extract_text() or ""
 
-            records = _extract_page(words, page_text)
-            for rec in records:
-                rec["File"] = path.name
-                rec["Page"] = page_num
-                rows.append(rec)
+            records = _extract_page_words(words, page_text)
+            for record in records:
+                record["File"] = path.name
+                record["Page"] = page_num
+                rows.append(record)
 
     if not rows:
-        df = pd.DataFrame(columns=_RAW_COLS)
+        df = pd.DataFrame(columns=["File", "Page", "EmployeeName", "SSN", "Address"])
     else:
-        df = pd.DataFrame(rows)
-        for col in _RAW_COLS:
-            if col not in df.columns:
-                df[col] = ""
-        df = df[_RAW_COLS]
-
-    wages_found = int(
-        df["box1_wages"].ne("").sum()
-        if not df.empty else 0
-    )
+        df = pd.DataFrame(rows)[["File", "Page", "EmployeeName", "SSN", "Address"]]
 
     info = {
         "file":             path.name,
@@ -672,7 +564,6 @@ def extract_w2(file_path: str, max_pages: int = 0) -> tuple[pd.DataFrame, dict]:
         "ssn_count":        int((df["SSN"] != "").sum()) if not df.empty else 0,
         "names_found":      int((df["EmployeeName"] != "").sum()) if not df.empty else 0,
         "addresses_found":  int((df["Address"] != "").sum()) if not df.empty else 0,
-        "wages_found":      wages_found,
         "status":           "OK",
         "error":            "",
     }
@@ -680,65 +571,63 @@ def extract_w2(file_path: str, max_pages: int = 0) -> tuple[pd.DataFrame, dict]:
 
 
 # ---------------------------------------------------------------------------
-# Batch extraction — all PDFs → ONE combined Excel file
+# Batch extraction
 # ---------------------------------------------------------------------------
 
-def extract_w2_batch(input_dir: str, output_path: str, max_pages: int = 0) -> None:
+def extract_w2_batch(input_dir: str, dest_dir: str, max_pages: int = 0) -> None:
     """
-    Process every PDF in *input_dir* and write ONE combined Excel file.
+    Process every PDF in *input_dir*. Each PDF gets its own output file:
+        <dest_dir>/<pdf_stem>.xlsx          — Extracted Data + Standardized Data sheets
+        <dest_dir>/<pdf_stem>_processing.xlsx — per-document summary
 
     Parameters
     ----------
     input_dir : str
         Directory containing W-2 PDF files.
-    output_path : str
-        Full path (or directory) for the combined output .xlsx file.
-        If a directory is given, defaults to <dir>/w2_wages_combined.xlsx.
+    dest_dir : str
+        Destination directory for output files.
     max_pages : int
-        Maximum pages to process per PDF. 0 = all pages.
+        Maximum pages to process per PDF. 0 (default) means all pages.
     """
     pdf_files = list(Path(input_dir).glob("*.pdf"))
     if not pdf_files:
         print(f"No PDF files found in: {input_dir}")
         return
 
-    out = Path(output_path)
-    if out.is_dir() or not out.suffix:
-        out = out / "w2_wages_combined.xlsx"
-    out.parent.mkdir(parents=True, exist_ok=True)
-
-    all_dfs: list[pd.DataFrame] = []
-    all_infos: list[dict] = []
+    Path(dest_dir).mkdir(parents=True, exist_ok=True)
+    total_records = 0
 
     for idx, pdf_path in enumerate(sorted(pdf_files), start=1):
         print(f"\n[{idx}/{len(pdf_files)}] {pdf_path.name}", flush=True)
+        out_xlsx = Path(dest_dir) / f"{pdf_path.stem}.xlsx"
         try:
             df, info = extract_w2(str(pdf_path), max_pages=max_pages)
-            all_dfs.append(df)
-            all_infos.append(info)
-            print(f"  [OK]  {len(df)} record(s)  wages found: {info['wages_found']}", flush=True)
+            summary_df = _build_processing_summary([info])
+            _save_excel(df, str(out_xlsx), summary_df)
+            total_records += len(df)
+            print(f"  [OK]  {len(df)} records -> {out_xlsx.name}", flush=True)
         except Exception as exc:
             print(f"  [ERR] {exc}", flush=True)
             err_info = {
                 "file": pdf_path.name, "pages_processed": 0, "records": 0,
                 "ssn_count": 0, "names_found": 0, "addresses_found": 0,
-                "wages_found": 0, "status": "ERROR", "error": str(exc),
+                "status": "ERROR", "error": str(exc),
             }
-            all_infos.append(err_info)
+            _save_excel(
+                pd.DataFrame(columns=["File", "Page", "EmployeeName", "SSN", "Address"]),
+                str(out_xlsx),
+                _build_processing_summary([err_info]),
+            )
 
-    combined_df = pd.concat(all_dfs, ignore_index=True) if all_dfs else pd.DataFrame(columns=_RAW_COLS)
-    summary_df  = _build_processing_summary(all_infos)
-
-    print(f"\nWriting combined output -> {out.name}", flush=True)
-    _save_excel(combined_df, str(out), summary_df)
-    print(f"\nBatch done. {len(combined_df)} total record(s) across {len(pdf_files)} file(s).")
+    print(f"\nBatch done. {total_records} total record(s) across {len(pdf_files)} file(s).")
 
 
 # ---------------------------------------------------------------------------
-# Debug helper
+# Entry point
 # ---------------------------------------------------------------------------
 
 def _debug_lines(file_path: str) -> None:
+    """Print word positions from the first page to help tune layout constants."""
     with pdfplumber.open(file_path) as pdf:
         words = pdf.pages[0].extract_words(use_text_flow=False, keep_blank_chars=False)
     print(f"\n--- Word positions from first page ({len(words)} words) ---")
@@ -751,22 +640,34 @@ def _debug_lines(file_path: str) -> None:
     print("---")
 
 
-# ---------------------------------------------------------------------------
-# Entry point
-# ---------------------------------------------------------------------------
-
 if __name__ == "__main__":
+    # Usage:
+    #   python w2_extractor.py <pdf_file>  [dest_dir]  [--pages N]
+    #   python w2_extractor.py <pdf_folder> [dest_dir] [--pages N]
+    #   python w2_extractor.py <pdf_file> --debug
+    #
+    # Single file — output saved as <dest_dir>/<pdf_stem>.xlsx  (default: same folder as PDF)
+    #   python w2_extractor.py sample.pdf
+    #   python w2_extractor.py sample.pdf "C:\Output"
+    #   python w2_extractor.py sample.pdf --pages 10
+    #
+    # Folder — each PDF gets its own <pdf_stem>.xlsx in dest_dir
+    #   python w2_extractor.py "C:\PDFs\"
+    #   python w2_extractor.py "C:\PDFs\" "C:\Output" --pages 20
+    #
+    # DO NOT pass real W-2 files containing live PII — use anonymised samples only.
+
     import argparse
 
     parser = argparse.ArgumentParser(
-        prog="w2_wages_extractor",
-        description="Extract Employee Name, SSN, Address, and Wage Amounts from W-2 PDFs.",
+        prog="w2_extractor",
+        description="Extract Employee Name, SSN, and Address from W-2 PDFs.",
     )
     parser.add_argument("target", help="PDF file or folder of PDFs to process")
     parser.add_argument("dest", nargs="?", default=None,
-                        help="Output file path or folder (batch: single combined .xlsx)")
+                        help="Destination folder for output files (default: same folder as input)")
     parser.add_argument("--pages", type=int, default=0, metavar="N",
-                        help="Only process the first N pages per file (default: all)")
+                        help="Only process the first N pages per file (default: all pages)")
     parser.add_argument("--debug", action="store_true",
                         help="Print word positions from first page and exit")
     args = parser.parse_args()
@@ -780,17 +681,14 @@ if __name__ == "__main__":
         sys.exit(1)
 
     if os.path.isdir(args.target):
-        dest = args.dest or str(Path(args.target) / "w2_wages_combined.xlsx")
+        dest = args.dest or args.target
         extract_w2_batch(args.target, dest, max_pages=args.pages)
     else:
         pdf_path = Path(args.target)
         dest_dir = Path(args.dest) if args.dest else pdf_path.parent
-        if dest_dir.suffix == ".xlsx":
-            out_xlsx = dest_dir
-        else:
-            out_xlsx = dest_dir / f"{pdf_path.stem}_wages.xlsx"
+        out_xlsx = dest_dir / f"{pdf_path.stem}.xlsx"
         result, info = extract_w2(args.target, max_pages=args.pages)
         summary_df = _build_processing_summary([info])
         print(result.to_string(index=False))
-        print(f"\nExtracted {len(result)} record(s)  wages found: {info['wages_found']}")
+        print(f"\nExtracted {len(result)} record(s) total")
         _save_excel(result, str(out_xlsx), summary_df)
