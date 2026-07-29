@@ -11,11 +11,13 @@ Layout fingerprinting approach:
     text/image blocks are mapped onto a coarse grid based on their bounding
     boxes, producing an occupancy pattern that reflects the template shape
     (headers, columns, tables) independent of the actual words on the page.
-  - Scanned/image-only pages (no usable text layer): the page is rasterized
-    and the same grid occupancy is derived from pixel darkness instead.
-  - Page orientation (portrait/landscape) and page type (text/image) are
-    kept as separate clustering keys, then bucket membership within a
-    key is decided by Hamming similarity between occupancy grids.
+    Page orientation (portrait/landscape) is kept as a separate clustering
+    key, then bucket membership within a key is decided by Hamming
+    similarity between occupancy grids.
+  - Scanned/image-only pages (no usable text layer) are NOT bucketed - they
+    are flagged with the note "scanned file" instead.
+  - Rotated pages (PDF /Rotate other than 0) are NOT bucketed - they are
+    flagged with the note "rotated file" instead.
 
 Requires: pymupdf  (pip install pymupdf)
 """
@@ -36,8 +38,6 @@ import fitz  # PyMuPDF
 GRID_COLS = 12
 GRID_ROWS = 16
 TEXT_CHAR_THRESHOLD = 15       # min chars on page to treat it as "text" type
-DARKNESS_OCCUPIED_CUTOFF = 25  # 0-255 scale; higher = stricter "has ink" test
-SAMPLE_STEPS = 8               # pixel samples per cell edge when rasterizing
 ERROR_BUCKET_NAME = "Unreadable_Error"
 
 
@@ -56,6 +56,10 @@ def compute_fingerprint(pdf_path):
         width, height = page.rect.width, page.rect.height
         if width <= 0 or height <= 0:
             return {"type": "error", "message": "Invalid page dimensions"}
+
+        if page.rotation != 0:
+            return {"type": "rotated"}
+
         orientation = "landscape" if width > height else "portrait"
 
         text_dict = page.get_text("dict")
@@ -67,14 +71,11 @@ def compute_fingerprint(pdf_path):
                 for span in line.get("spans", []):
                     total_chars += len(span.get("text", "").strip())
 
-        if total_chars >= TEXT_CHAR_THRESHOLD:
-            grid = _grid_from_blocks(blocks, width, height)
-            page_type = "text"
-        else:
-            grid = _grid_from_pixels(page, width, height)
-            page_type = "image"
+        if total_chars < TEXT_CHAR_THRESHOLD:
+            return {"type": "scanned"}
 
-        return {"type": page_type, "orientation": orientation, "grid": grid}
+        grid = _grid_from_blocks(blocks, width, height)
+        return {"type": "text", "orientation": orientation, "grid": grid}
 
     except Exception as exc:  # noqa: BLE001 - want to bucket ANY failure, not crash
         return {"type": "error", "message": f"{type(exc).__name__}: {exc}"}
@@ -100,36 +101,6 @@ def _grid_from_blocks(blocks, width, height):
     return grid
 
 
-def _grid_from_pixels(page, width, height):
-    pix = page.get_pixmap(colorspace=fitz.csGRAY)
-    samples = pix.samples
-    pw, ph = pix.width, pix.height
-    grid = [0] * (GRID_COLS * GRID_ROWS)
-
-    cell_w = pw / GRID_COLS
-    cell_h = ph / GRID_ROWS
-
-    for r in range(GRID_ROWS):
-        y0 = int(r * cell_h)
-        y1 = max(y0 + 1, int((r + 1) * cell_h))
-        step_y = max(1, (y1 - y0) // SAMPLE_STEPS)
-        for c in range(GRID_COLS):
-            x0 = int(c * cell_w)
-            x1 = max(x0 + 1, int((c + 1) * cell_w))
-            step_x = max(1, (x1 - x0) // SAMPLE_STEPS)
-
-            total = 0
-            count = 0
-            for y in range(y0, y1, step_y):
-                row_offset = y * pw
-                for x in range(x0, x1, step_x):
-                    total += samples[row_offset + x]
-                    count += 1
-            avg = (total / count) if count else 255
-            grid[r * GRID_COLS + c] = 1 if (255 - avg) > DARKNESS_OCCUPIED_CUTOFF else 0
-    return grid
-
-
 def _clamp(value, lo, hi):
     return max(lo, min(hi, value))
 
@@ -140,22 +111,19 @@ def _similarity(grid_a, grid_b):
 
 
 class BucketAssigner:
-    """Greedy clustering: each new fingerprint joins the first bucket it's
-    similar enough to (within the same type/orientation), else starts a new one."""
+    """Greedy clustering over text-type fingerprints only: each new
+    fingerprint joins the first bucket it's similar enough to (within the
+    same orientation), else starts a new one."""
 
     def __init__(self, threshold):
         self.threshold = threshold
-        self.buckets = []  # [{name, type, orientation, grid}]
+        self.buckets = []  # [{name, orientation, grid}]
         self._counter = 1
 
     def assign(self, fingerprint):
-        if fingerprint["type"] == "error":
-            return ERROR_BUCKET_NAME
-
         for bucket in self.buckets:
             if (
-                bucket["type"] == fingerprint["type"]
-                and bucket["orientation"] == fingerprint["orientation"]
+                bucket["orientation"] == fingerprint["orientation"]
                 and _similarity(bucket["grid"], fingerprint["grid"]) >= self.threshold
             ):
                 return bucket["name"]
@@ -164,7 +132,6 @@ class BucketAssigner:
         self._counter += 1
         self.buckets.append({
             "name": name,
-            "type": fingerprint["type"],
             "orientation": fingerprint["orientation"],
             "grid": fingerprint["grid"],
         })
@@ -189,8 +156,17 @@ def process_folder(folder, threshold, progress_callback):
     for i, filename in enumerate(filenames, start=1):
         full_path = os.path.join(folder, filename)
         fingerprint = compute_fingerprint(full_path)
-        bucket_name = assigner.assign(fingerprint)
-        notes = fingerprint.get("message", "") if fingerprint["type"] == "error" else ""
+        ftype = fingerprint["type"]
+
+        if ftype == "error":
+            bucket_name, notes = ERROR_BUCKET_NAME, fingerprint.get("message", "")
+        elif ftype == "rotated":
+            bucket_name, notes = "", "rotated file"
+        elif ftype == "scanned":
+            bucket_name, notes = "", "scanned file"
+        else:
+            bucket_name, notes = assigner.assign(fingerprint), ""
+
         rows.append((filename, bucket_name, notes))
         progress_callback(i, total, filename)
 
@@ -211,7 +187,7 @@ class App:
         root.resizable(False, False)
 
         self.folder_var = StringVar()
-        self.threshold_var = DoubleVar(value=0.85)
+        self.threshold_var = DoubleVar(value=1.00)
         self.status_var = StringVar(value="Choose a folder of PDFs to begin.")
 
         pad = {"padx": 8, "pady": 6}
@@ -263,7 +239,7 @@ class App:
         try:
             threshold = float(self.threshold_var.get())
         except (ValueError, TypeError):
-            threshold = 0.85
+            threshold = 1.00
         threshold = _clamp(threshold, 0.50, 1.00)
 
         pdf_count = sum(
