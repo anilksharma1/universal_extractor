@@ -1,23 +1,36 @@
 """
 PDF Format Bucket Grouper
 
-Scans a folder of PDFs, fingerprints the LAYOUT of each file's first page
+Scans a folder of PDFs, fingerprints the LAYOUT of each file's first pages
 (no data extraction - only structural shape is analyzed), and groups files
 that share a similar layout into the same "bucket". Output is a CSV with
 File Name / Bucket Name.
 
 Layout fingerprinting approach:
-  - Text-based pages (a selectable text layer is present): the first page's
+  - Text-based pages (a selectable text layer is present): for each of the
+    first PAGES_TO_ANALYZE pages (fewer if the document is shorter), the
     text/image blocks are mapped onto a coarse grid based on their bounding
     boxes, producing an occupancy pattern that reflects the template shape
     (headers, columns, tables) independent of the actual words on the page.
+    Each page's grid is concatenated into one combined fingerprint, so
+    documents that look alike on page 1 but diverge on later pages (e.g.
+    a W-2 vs. a similarly-laid-out 2222 form) still separate cleanly.
     Page orientation (portrait/landscape) is kept as a separate clustering
-    key, then bucket membership within a key is decided by Hamming
-    similarity between occupancy grids.
-  - Scanned/image-only pages (no usable text layer) are NOT bucketed - they
-    are flagged with the note "scanned file" instead.
-  - Rotated pages (PDF /Rotate other than 0) are NOT bucketed - they are
-    flagged with the note "rotated file" instead.
+    key.
+  - Alongside layout, the same pages' words are read into a "vocabulary"
+    (alphabetic words, common stopwords removed - numbers/amounts/SSNs are
+    dropped by construction, so this is a text-pattern signature, not the
+    extracted data itself). Two documents whose vocabularies overlap
+    strongly are recognized as the same template even when their layout
+    grids don't line up exactly (e.g. due to scan jitter or reflow).
+  - A file joins an existing bucket when EITHER its layout similarity meets
+    the layout threshold OR its vocabulary overlap meets the text-pattern
+    threshold (both configurable in the UI); otherwise it starts a new
+    bucket.
+  - Scanned/image-only pages (no usable text layer on page 1) are NOT
+    bucketed - they are flagged with the note "scanned file" instead.
+  - Rotated pages (PDF /Rotate other than 0, on any analyzed page) are NOT
+    bucketed - they are flagged with the note "rotated file" instead.
 
 Requires: pymupdf  (pip install pymupdf)
 """
@@ -37,12 +50,21 @@ import fitz  # PyMuPDF
 
 GRID_COLS = 12
 GRID_ROWS = 16
-TEXT_CHAR_THRESHOLD = 15       # min chars on page to treat it as "text" type
+PAGES_TO_ANALYZE = 4           # look at up to this many leading pages per PDF
+TEXT_CHAR_THRESHOLD = 15       # min chars on page 1 to treat the doc as "text" type
+MIN_TOKEN_LEN = 4              # ignore very short words when building the vocabulary
 ERROR_BUCKET_NAME = "Unreadable_Error"
+
+STOPWORDS = {
+    "the", "and", "for", "of", "to", "in", "on", "is", "are", "or", "by",
+    "with", "this", "that", "as", "be", "an", "at", "from", "your", "you",
+    "will", "not", "may", "any", "all", "such", "into", "than", "then",
+    "have", "has", "was", "were", "been", "each", "date", "page",
+}
 
 
 def compute_fingerprint(pdf_path):
-    """Return a dict describing the layout of a PDF's first page."""
+    """Return a dict describing the layout of a PDF's first pages."""
     doc = None
     try:
         doc = fitz.open(pdf_path)
@@ -52,36 +74,46 @@ def compute_fingerprint(pdf_path):
         if doc.page_count == 0:
             return {"type": "error", "message": "No pages in file"}
 
-        page = doc[0]
-        width, height = page.rect.width, page.rect.height
+        num_pages = min(PAGES_TO_ANALYZE, doc.page_count)
+        pages = [doc[i] for i in range(num_pages)]
+
+        first = pages[0]
+        width, height = first.rect.width, first.rect.height
         if width <= 0 or height <= 0:
             return {"type": "error", "message": "Invalid page dimensions"}
 
-        if page.rotation != 0:
+        if any(p.rotation != 0 for p in pages):
             return {"type": "rotated"}
 
         orientation = "landscape" if width > height else "portrait"
 
-        text_dict = page.get_text("dict")
-        blocks = text_dict.get("blocks", [])
-
-        total_chars = 0
-        for block in blocks:
-            for line in block.get("lines", []):
-                for span in line.get("spans", []):
-                    total_chars += len(span.get("text", "").strip())
-
-        if total_chars < TEXT_CHAR_THRESHOLD:
+        first_blocks = first.get_text("dict").get("blocks", [])
+        if _count_chars(first_blocks) < TEXT_CHAR_THRESHOLD:
             return {"type": "scanned"}
 
-        grid = _grid_from_blocks(blocks, width, height)
-        return {"type": "text", "orientation": orientation, "grid": grid}
+        combined_grid = []
+        tokens = set()
+        for page in pages:
+            blocks = page.get_text("dict").get("blocks", [])
+            combined_grid.extend(_grid_from_blocks(blocks, page.rect.width, page.rect.height))
+            tokens.update(_extract_tokens(page.get_text("text")))
+
+        return {"type": "text", "orientation": orientation, "grid": combined_grid, "tokens": tokens}
 
     except Exception as exc:  # noqa: BLE001 - want to bucket ANY failure, not crash
         return {"type": "error", "message": f"{type(exc).__name__}: {exc}"}
     finally:
         if doc is not None:
             doc.close()
+
+
+def _count_chars(blocks):
+    total = 0
+    for block in blocks:
+        for line in block.get("lines", []):
+            for span in line.get("spans", []):
+                total += len(span.get("text", "").strip())
+    return total
 
 
 def _grid_from_blocks(blocks, width, height):
@@ -110,22 +142,40 @@ def _similarity(grid_a, grid_b):
     return matches / len(grid_a) if grid_a else 0.0
 
 
+def _extract_tokens(text):
+    tokens = set()
+    for raw in text.split():
+        word = "".join(ch for ch in raw.lower() if ch.isalpha())
+        if len(word) >= MIN_TOKEN_LEN and word not in STOPWORDS:
+            tokens.add(word)
+    return tokens
+
+
+def _jaccard(tokens_a, tokens_b):
+    if not tokens_a or not tokens_b:
+        return 0.0
+    return len(tokens_a & tokens_b) / len(tokens_a | tokens_b)
+
+
 class BucketAssigner:
     """Greedy clustering over text-type fingerprints only: each new
     fingerprint joins the first bucket it's similar enough to (within the
-    same orientation), else starts a new one."""
+    same orientation) on EITHER layout or text-pattern grounds, else starts
+    a new one."""
 
-    def __init__(self, threshold):
-        self.threshold = threshold
-        self.buckets = []  # [{name, orientation, grid}]
+    def __init__(self, layout_threshold, text_threshold):
+        self.layout_threshold = layout_threshold
+        self.text_threshold = text_threshold
+        self.buckets = []  # [{name, orientation, grid, tokens}]
         self._counter = 1
 
     def assign(self, fingerprint):
         for bucket in self.buckets:
-            if (
-                bucket["orientation"] == fingerprint["orientation"]
-                and _similarity(bucket["grid"], fingerprint["grid"]) >= self.threshold
-            ):
+            if bucket["orientation"] != fingerprint["orientation"]:
+                continue
+            layout_sim = _similarity(bucket["grid"], fingerprint["grid"])
+            text_sim = _jaccard(bucket["tokens"], fingerprint["tokens"])
+            if layout_sim >= self.layout_threshold or text_sim >= self.text_threshold:
                 return bucket["name"]
 
         name = f"Bucket_{self._counter}"
@@ -134,11 +184,12 @@ class BucketAssigner:
             "name": name,
             "orientation": fingerprint["orientation"],
             "grid": fingerprint["grid"],
+            "tokens": fingerprint["tokens"],
         })
         return name
 
 
-def process_folder(folder, threshold, progress_callback):
+def process_folder(folder, layout_threshold, text_threshold, progress_callback):
     """Walk the top-level of `folder` for PDFs, bucket them, return row list.
 
     progress_callback(done, total, current_filename) is invoked after each file.
@@ -149,7 +200,7 @@ def process_folder(folder, threshold, progress_callback):
         if f.lower().endswith(".pdf") and os.path.isfile(os.path.join(folder, f))
     )
 
-    assigner = BucketAssigner(threshold)
+    assigner = BucketAssigner(layout_threshold, text_threshold)
     rows = []
     total = len(filenames)
 
@@ -187,7 +238,8 @@ class App:
         root.resizable(False, False)
 
         self.folder_var = StringVar()
-        self.threshold_var = DoubleVar(value=1.00)
+        self.layout_threshold_var = DoubleVar(value=0.92)
+        self.text_threshold_var = DoubleVar(value=0.60)
         self.status_var = StringVar(value="Choose a folder of PDFs to begin.")
 
         pad = {"padx": 8, "pady": 6}
@@ -203,24 +255,34 @@ class App:
             row=0, column=2, **pad
         )
 
-        ttk.Label(frame, text="Similarity threshold (0.50 - 1.00):").grid(
+        ttk.Label(frame, text="Layout similarity threshold (0.50 - 1.00):").grid(
             row=1, column=0, sticky=W, **pad
         )
         ttk.Spinbox(
-            frame, from_=0.50, to=1.00, increment=0.05, textvariable=self.threshold_var, width=8
+            frame, from_=0.50, to=1.00, increment=0.05, textvariable=self.layout_threshold_var, width=8
         ).grid(row=1, column=1, sticky=W, **pad)
         ttk.Label(
             frame, text="(higher = stricter, more buckets)", foreground="gray"
         ).grid(row=1, column=2, sticky=W, **pad)
 
+        ttk.Label(frame, text="Text pattern threshold (0.10 - 1.00):").grid(
+            row=2, column=0, sticky=W, **pad
+        )
+        ttk.Spinbox(
+            frame, from_=0.10, to=1.00, increment=0.05, textvariable=self.text_threshold_var, width=8
+        ).grid(row=2, column=1, sticky=W, **pad)
+        ttk.Label(
+            frame, text="(shared vocabulary can also merge a file into a bucket)", foreground="gray"
+        ).grid(row=2, column=2, sticky=W, **pad)
+
         self.run_button = ttk.Button(frame, text="Run", command=self.run)
-        self.run_button.grid(row=2, column=0, columnspan=3, pady=(4, 10))
+        self.run_button.grid(row=3, column=0, columnspan=3, pady=(4, 10))
 
         self.progress = ttk.Progressbar(frame, length=440, mode="determinate")
-        self.progress.grid(row=3, column=0, columnspan=3, **pad)
+        self.progress.grid(row=4, column=0, columnspan=3, **pad)
 
         ttk.Label(frame, textvariable=self.status_var, wraplength=440, justify="left").grid(
-            row=4, column=0, columnspan=3, sticky=W, **pad
+            row=5, column=0, columnspan=3, sticky=W, **pad
         )
 
         self._queue = queue.Queue()
@@ -237,10 +299,16 @@ class App:
             return
 
         try:
-            threshold = float(self.threshold_var.get())
+            layout_threshold = float(self.layout_threshold_var.get())
         except (ValueError, TypeError):
-            threshold = 1.00
-        threshold = _clamp(threshold, 0.50, 1.00)
+            layout_threshold = 0.92
+        layout_threshold = _clamp(layout_threshold, 0.50, 1.00)
+
+        try:
+            text_threshold = float(self.text_threshold_var.get())
+        except (ValueError, TypeError):
+            text_threshold = 0.60
+        text_threshold = _clamp(text_threshold, 0.10, 1.00)
 
         pdf_count = sum(
             1 for f in os.listdir(folder)
@@ -266,17 +334,19 @@ class App:
         self.status_var.set(f"Processing 0/{pdf_count}...")
 
         worker = threading.Thread(
-            target=self._worker, args=(folder, threshold, csv_path), daemon=True
+            target=self._worker,
+            args=(folder, layout_threshold, text_threshold, csv_path),
+            daemon=True,
         )
         worker.start()
         self.root.after(100, self._poll_queue)
 
-    def _worker(self, folder, threshold, csv_path):
+    def _worker(self, folder, layout_threshold, text_threshold, csv_path):
         try:
             def progress_callback(done, total, filename):
                 self._queue.put(("progress", done, total, filename))
 
-            rows = process_folder(folder, threshold, progress_callback)
+            rows = process_folder(folder, layout_threshold, text_threshold, progress_callback)
             write_csv(rows, csv_path)
             bucket_names = sorted(set(r[1] for r in rows))
             self._queue.put(("done", csv_path, len(rows), len(bucket_names)))
