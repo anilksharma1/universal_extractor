@@ -3,7 +3,7 @@ universal_pdf_extractor.py — single entry point for every document-specific
 PDF extractor in this project, dispatched by subcommand:
 
     python universal_pdf_extractor.py w2            <input> [options]
-    python universal_pdf_extractor.py 1095c          <input> <bde_template.xlsx> [options]
+    python universal_pdf_extractor.py 1095c          <input> [options]
     python universal_pdf_extractor.py claims         <input> [options]
     python universal_pdf_extractor.py patient-info   <input> [options]
     python universal_pdf_extractor.py gross-pay      <input> [options]
@@ -12,10 +12,10 @@ PDF extractor in this project, dispatched by subcommand:
     python universal_pdf_extractor.py generic        <input> [options]
     python universal_pdf_extractor.py bucket11       <input> [options]
 
-Every subcommand writes its primary output next to the source PDF (or into
--o/--output-dir) as "<stem>_extracted.xlsx"; secondary outputs (template
-mappings, processing summaries, combined workbooks) use that same stem with
-an additional suffix, e.g. "<stem>_extracted_template.xlsx".
+Every subcommand writes only the extracted data, next to the source PDF (or
+into -o/--output-dir) as "<stem>_extracted.xlsx" -- no external template file
+is required or used; secondary outputs are limited to per-file processing
+summaries and combined workbooks (e.g. combined_extracted.xlsx for w2/claims).
 
 Run `python universal_pdf_extractor.py <subcommand> --help` for that
 subcommand's own options.
@@ -838,15 +838,6 @@ def cmd_w2(args) -> int:
 
 C1095_MIN_TEXT_CHARS_PER_PAGE = 20
 
-C1095_TEMPLATE_SHEET_NAME = "Import Template"
-C1095_TEMPLATE_COL = {
-    "Doc ID": 1, "First Name": 2, "Middle Name": 3, "Last Name": 4,
-    "Entity Type_Employee": 7, "Street Address": 11, "City": 12,
-    "State": 13, "Zip Code": 14, "Country": 19,
-    "Social Security Number (SSN)": 23,
-}
-C1095_TEMPLATE_PAGE_COL = 66
-
 C1095_OUTPUT_COLUMNS = ["Page", "Format", "First Name", "Middle Name", "Last Name",
                          "Street Address", "City", "State", "Zip Code", "Country", "SSN"]
 
@@ -1081,31 +1072,6 @@ def c1095_build_workbook(records):
     return wb
 
 
-def c1095_build_template_workbook(template_path, records, doc_id):
-    records = c1095_dedupe_complete_rows(records)
-    wb = openpyxl.load_workbook(template_path)
-    ws = wb[C1095_TEMPLATE_SHEET_NAME]
-    ws.cell(row=1, column=C1095_TEMPLATE_PAGE_COL, value="Page #")
-    ws.cell(row=2, column=C1095_TEMPLATE_PAGE_COL, value="Page #")
-
-    row_ptr = 3
-    for rec in records:
-        ws.cell(row=row_ptr, column=C1095_TEMPLATE_COL["Doc ID"], value=doc_id)
-        ws.cell(row=row_ptr, column=C1095_TEMPLATE_COL["First Name"], value=rec.get("First Name", ""))
-        ws.cell(row=row_ptr, column=C1095_TEMPLATE_COL["Middle Name"], value=rec.get("Middle Name", ""))
-        ws.cell(row=row_ptr, column=C1095_TEMPLATE_COL["Last Name"], value=rec.get("Last Name", ""))
-        ws.cell(row=row_ptr, column=C1095_TEMPLATE_COL["Entity Type_Employee"], value=True)
-        ws.cell(row=row_ptr, column=C1095_TEMPLATE_COL["Street Address"], value=rec.get("Street Address", ""))
-        ws.cell(row=row_ptr, column=C1095_TEMPLATE_COL["City"], value=rec.get("City", ""))
-        ws.cell(row=row_ptr, column=C1095_TEMPLATE_COL["State"], value=rec.get("State", ""))
-        ws.cell(row=row_ptr, column=C1095_TEMPLATE_COL["Zip Code"], value=rec.get("Zip Code", ""))
-        ws.cell(row=row_ptr, column=C1095_TEMPLATE_COL["Country"], value=rec.get("Country", ""))
-        ws.cell(row=row_ptr, column=C1095_TEMPLATE_COL["Social Security Number (SSN)"], value=rec.get("SSN", ""))
-        ws.cell(row=row_ptr, column=C1095_TEMPLATE_PAGE_COL, value=rec.get("Page", ""))
-        row_ptr += 1
-    return wb
-
-
 def cmd_1095c(args) -> int:
     if not HAS_FITZ:
         sys.exit("ERROR: pymupdf is required. Run: pip install pymupdf")
@@ -1121,12 +1087,6 @@ def cmd_1095c(args) -> int:
     output_dir = Path(args.output_dir) if args.output_dir else input_path.parent if input_path.is_file() else input_path
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    tmpl_wb = openpyxl.load_workbook(args.template, read_only=True)
-    if C1095_TEMPLATE_SHEET_NAME not in tmpl_wb.sheetnames:
-        print(f"Sheet '{C1095_TEMPLATE_SHEET_NAME}' not found in template: {args.template}")
-        return 1
-    tmpl_wb.close()
-
     for pdf in pdf_files:
         print(f"Processing {pdf.name} ...")
         records = c1095_process_pdf(pdf, debug=args.debug, output_dir=output_dir)
@@ -1134,14 +1094,10 @@ def cmd_1095c(args) -> int:
             print(f"  no records extracted from {pdf.name}")
             continue
 
+        records = c1095_dedupe_complete_rows(records)
         extracted_path = _extracted_path(pdf, output_dir)
-        template_path = _extracted_path(pdf, output_dir, "_extracted_template.xlsx")
-
         c1095_build_workbook(records).save(extracted_path)
-        c1095_build_template_workbook(args.template, records, pdf.name).save(template_path)
-
         print(f"  -> {extracted_path.name} ({len(records)} record(s))")
-        print(f"  -> {template_path.name}")
 
     return 0
 
@@ -2068,12 +2024,6 @@ GP_HEADER_DEFS = [
 ]
 GP_REPORT_COLUMNS = [label for label, _ in GP_HEADER_DEFS]
 
-GP_TEMPLATE_SHEET_NAME = "Import Template"
-GP_TEMPLATE_COL = {
-    "Doc ID": 1, "First Name": 2, "Middle Name": 3, "Last Name": 4,
-    "Entity Type_Employee": 7, "Social Security Number (SSN)": 23,
-}
-
 
 def gp_group_words_into_lines(words, y_tol=3):
     lines = {}
@@ -2169,39 +2119,6 @@ def gp_format_ssn(raw: str) -> str:
     return digits
 
 
-def gp_split_last_first_middle(name: str):
-    name = (name or "").strip()
-    if not name:
-        return "", "", ""
-    if "," in name:
-        last, rest = name.split(",", 1)
-        parts = rest.strip().split()
-        first = parts[0] if parts else ""
-        middle = " ".join(parts[1:]) if len(parts) > 1 else ""
-        return last.strip(), first, middle
-    print(f"  [warn] name '{name}' has no comma ('Last, First' expected) -- placed entirely in Last Name")
-    return name, "", ""
-
-
-def gp_find_template(folder: Path) -> Path:
-    candidates = [
-        p for p in folder.glob("*.xlsx")
-        if not p.name.startswith("~$")
-        and "template" in p.name.lower()
-        and "_extracted" not in p.name.lower()
-    ]
-    if not candidates:
-        raise FileNotFoundError(
-            f"No BDE template file found in {folder} "
-            f"(expected an .xlsx with 'template' in its name, e.g. 'BDE Template_Community Health.xlsx')"
-        )
-    if len(candidates) > 1:
-        raise FileNotFoundError(
-            f"Multiple possible template files found in {folder}: {[c.name for c in candidates]}. Keep only one."
-        )
-    return candidates[0]
-
-
 def gp_build_extracted_workbook(records):
     wb = openpyxl.Workbook()
     ws = wb.active
@@ -2218,25 +2135,6 @@ def gp_build_extracted_workbook(records):
     return wb
 
 
-def gp_build_template_workbook(template_path, records):
-    wb = openpyxl.load_workbook(template_path)
-    ws = wb[GP_TEMPLATE_SHEET_NAME]
-
-    row_ptr = 3
-    for rec in records:
-        last, first, middle = gp_split_last_first_middle(rec.get("Employee Name", ""))
-        ws.cell(row=row_ptr, column=GP_TEMPLATE_COL["Doc ID"], value=rec.get("Doc ID", ""))
-        ws.cell(row=row_ptr, column=GP_TEMPLATE_COL["First Name"], value=first)
-        ws.cell(row=row_ptr, column=GP_TEMPLATE_COL["Middle Name"], value=middle)
-        ws.cell(row=row_ptr, column=GP_TEMPLATE_COL["Last Name"], value=last)
-        ws.cell(row=row_ptr, column=GP_TEMPLATE_COL["Entity Type_Employee"], value=True)
-        ssn_cell = ws.cell(row=row_ptr, column=GP_TEMPLATE_COL["Social Security Number (SSN)"],
-                            value=gp_format_ssn(rec.get("SSN", "")))
-        ssn_cell.number_format = "@"
-        row_ptr += 1
-    return wb
-
-
 def cmd_gross_pay(args) -> int:
     if not HAS_FITZ:
         sys.exit("ERROR: pymupdf is required. Run: pip install pymupdf")
@@ -2249,26 +2147,6 @@ def cmd_gross_pay(args) -> int:
         print(f"No PDF files found at: {input_path}")
         return 0
 
-    search_dir = input_path.parent if input_path.is_file() else input_path
-    if args.template:
-        template_path = Path(args.template)
-        if not template_path.exists():
-            print(f"Template not found: {template_path}")
-            return 1
-    else:
-        try:
-            template_path = gp_find_template(search_dir)
-        except FileNotFoundError as e:
-            print(e)
-            return 1
-    print(f"Using template: {template_path.name}")
-
-    check_wb = openpyxl.load_workbook(template_path, read_only=True)
-    if GP_TEMPLATE_SHEET_NAME not in check_wb.sheetnames:
-        print(f"Sheet '{GP_TEMPLATE_SHEET_NAME}' not found in template: {template_path}")
-        return 1
-    check_wb.close()
-
     for pdf in tqdm(pdf_files, desc="Extracting", unit="file"):
         records = gp_process_pdf(pdf)
         if not records:
@@ -2279,11 +2157,7 @@ def cmd_gross_pay(args) -> int:
 
         extracted_path = _extracted_path(pdf, args.output_dir)
         gp_build_extracted_workbook(records).save(extracted_path)
-
-        template_out_path = _extracted_path(pdf, args.output_dir, "_extracted_template.xlsx")
-        gp_build_template_workbook(template_path, records).save(template_out_path)
-
-        print(f"  {pdf.name} -> {extracted_path.name}, {template_out_path.name}")
+        print(f"  {pdf.name} -> {extracted_path.name}")
 
     return 0
 
@@ -3014,17 +2888,6 @@ K401_FALLBACK_HEADER = [
 ]
 
 
-def k401_load_template_rows(template_path: Path):
-    try:
-        wb = openpyxl.load_workbook(str(template_path))
-        ws = wb.active
-        header_row = [_clean(str(ws.cell(row=1, column=c).value or "")) for c in range(1, K401_TEMPLATE_COL_COUNT + 1)]
-        wb.close()
-        return header_row
-    except Exception:
-        return []
-
-
 def k401_write_sheet(ws, header, records):
     ws.append(header)
     for rec in records:
@@ -3033,19 +2896,16 @@ def k401_write_sheet(ws, header, records):
         ws.append(["No employee records extracted."])
 
 
-def k401_write_workbook(out_path: Path, records, template_path=None):
+def k401_write_workbook(out_path: Path, records) -> None:
     tmp = out_path.with_suffix(".tmp.xlsx")
     wb = openpyxl.Workbook()
 
-    header_row = k401_load_template_rows(template_path) if (template_path and template_path.exists()) else []
-    hdr = header_row if header_row else K401_FALLBACK_HEADER
-
     ws = wb.active
     ws.title = "Employees"
-    k401_write_sheet(ws, hdr, records)
+    k401_write_sheet(ws, K401_FALLBACK_HEADER, records)
 
     ws_ext = wb.create_sheet(title="Extracted")
-    k401_write_sheet(ws_ext, hdr, k401_deduplicate_extracted(records))
+    k401_write_sheet(ws_ext, K401_FALLBACK_HEADER, k401_deduplicate_extracted(records))
 
     wb.save(tmp)
     wb.close()
@@ -3070,20 +2930,6 @@ def cmd_401k(args) -> int:
     if not target.exists():
         sys.exit(f"ERROR: path not found -- {target}")
 
-    if args.template:
-        template_path = Path(args.template)
-    else:
-        script_dir = Path(__file__).parent
-        target_dir = target if target.is_dir() else target.parent
-        candidates = [script_dir / "Latest Template.xlsx", target_dir / "Latest Template.xlsx"]
-        template_path = next((p for p in candidates if p.exists()), None)
-
-    if template_path and template_path.exists():
-        print(f"Template: {template_path.name}")
-    else:
-        print("WARNING: 'Latest Template.xlsx' not found -- using built-in headers. Use --template to specify its path.")
-        template_path = None
-
     files = list(_iter_pdfs(target, args.recursive))
     if not files:
         sys.exit(f"ERROR: no .pdf files found at {target}")
@@ -3098,7 +2944,7 @@ def cmd_401k(args) -> int:
         try:
             records = k401_extract(pdf_path, doc_id)
             out_path = _extracted_path(pdf_path, output_dir)
-            k401_write_workbook(out_path, records, template_path)
+            k401_write_workbook(out_path, records)
             total_records += len(records)
         except Exception as exc:
             errors.append(f"{pdf_path.name}: {exc}")
@@ -3961,7 +3807,7 @@ def cmd_generic(args) -> int:
 
 # ===========================================================================
 # bucket11 — Employee Payroll Changes from ADP "Employee Payroll Changes" PDFs
-# Ported from bucket_11.py (pdfplumber, 3-column table + fuzzy header mapping).
+# Ported from employee_ADP.py (pdfplumber, 3-column table + fuzzy header mapping).
 # ===========================================================================
 
 import difflib as _difflib
@@ -3979,97 +3825,6 @@ B11_NO_RECORDS = (
     "No employee records found -- no 'Associate ID:' header rows detected in "
     "this PDF. Run --diagnose to inspect the raw text."
 )
-
-B11_BUCKET11_MAP = {
-    "Additional Earnings Amount":       (None, "Work-Related Information", "Salary or Compensation Information"),
-    "Address - City":                   ("City", "Contact Information", "Home address"),
-    "Address - Country":                ("Country of Residence", "Contact Information", "Home address"),
-    "Address - Line 1":                 ("Residential Address", "Contact Information", "Home address"),
-    "Address - Line 2":                 ("Residential Address", "Contact Information", "Home address"),
-    "Address - Line 2 No":              ("Residential Address", "Contact Information", "Home address"),
-    "Address - Line 3":                 ("Residential Address", "Contact Information", "Home address"),
-    "Address - State":                  ("State of Residence (if US)", "Contact Information", "Home address"),
-    "Address - State No":               ("State of Residence (if US)", "Contact Information", "Home address"),
-    "Address - Zip / Postal Code":      ("Zip Code", "Contact Information", "Home address"),
-    "Address - Zip / Postal Code No":   ("Zip Code", "Contact Information", "Home address"),
-    "Basis of Pay":                     (None, "Work-Related Information", "Salary or Compensation Information"),
-    "Basis of Pay No":                  (None, "Work-Related Information", "Salary or Compensation Information"),
-    "Defer Social Security tax":        (None, "Government-Issued Identification", "Taxpayer Identification Number (TIN)"),
-    "Dependents No":                    (None, "Family Information", None),
-    "Direct Deposit - Account Number":  (None, "Financial Account Information", "Financial account number"),
-    "Employee Name - First":            ("First Name", None, None),
-    "Employee Name - First No":         ("First Name", None, None),
-    "Employee Name - Last":             ("Last Name", None, None),
-    "Employee Name - Last No":          ("Last Name", None, None),
-    "Employee Name - Middle":           ("Middle Name", None, None),
-    "Employee Name - Preferred":        ("PI Notes", None, None),
-    "Employee Name - Salutation":       ("Suffix", None, None),
-    "Ethnicity/Race":                   (None, "Demographic Information", "Race/ Ethnicity"),
-    "Ethnicity/Race No":                (None, "Demographic Information", "Race/ Ethnicity"),
-    "Gender for Insurance Coverage No": (None, "Health Related Information", "Health Insurance Information"),
-    "Home Phone":                       ("Phone Number", "Contact Information", "Personal phone number (home)"),
-    "Job Title No":                     (None, "Work-Related Information", "Employment Application Information"),
-    "Lien Dependent Medical Insurance": (None, "Health Related Information", "Health Insurance Information"),
-    "Other Income":                     (None, "Work-Related Information", "Salary or Compensation Information"),
-    "Payee":                            (None, "Financial Account Information", "Financial account number"),
-    "Payroll Name - First":             ("PI Notes", None, None),
-    "Payroll Name - First No":          ("PI Notes", None, None),
-    "Payroll Name - Last":              ("PI Notes", None, None),
-    "Payroll Name - Last No":           ("PI Notes", None, None),
-    "Personal E-mail":                  ("Email Address - Personal", "Contact Information", "Personal email address"),
-    "Personal E-mail No":               ("Email Address - Personal", "Contact Information", "Personal email address"),
-    "Personal Mobile":                  ("Phone Number", "Contact Information", "Personal phone number (mobile)"),
-    "Personal Mobile No":               ("Phone Number", "Contact Information", "Personal phone number (mobile)"),
-    "Rate 1":                           (None, "Work-Related Information", "Salary or Compensation Information"),
-    "Rate 1 No":                        (None, "Work-Related Information", "Salary or Compensation Information"),
-    "Rate 2":                           (None, "Work-Related Information", "Salary or Compensation Information"),
-    "Rate 6":                           (None, "Work-Related Information", "Salary or Compensation Information"),
-    "Rate 8":                           (None, "Work-Related Information", "Salary or Compensation Information"),
-    "Social Security Number":           ("Social Security Number", "Government-Issued Identification", "Social Security Number (SSN)"),
-    "Status":                           (None, "Work-Related Information", "Employment Application Information"),
-    "Tax ID Type":                      (None, "Government-Issued Identification", "Taxpayer Identification Number (TIN)"),
-    "Termination Date":                 (None, "Work-Related Information", "Employment Application Information"),
-    "Termination Reason":               (None, "Work-Related Information", "Disciplinary Record or Report"),
-}
-
-B11_ALIASES = {
-    "ssn": "Social Security Number", "ss number": "Social Security Number",
-    "social security": "Social Security Number", "soc sec": "Social Security Number",
-    "ss no": "Social Security Number",
-    "first name": "Employee Name - First", "last name": "Employee Name - Last",
-    "middle name": "Employee Name - Middle", "preferred name": "Employee Name - Preferred",
-    "salutation": "Employee Name - Salutation", "payroll first name": "Payroll Name - First",
-    "payroll last name": "Payroll Name - Last",
-    "email": "Personal E-mail", "e mail": "Personal E-mail", "personal email": "Personal E-mail",
-    "work email": "Personal E-mail", "mobile": "Personal Mobile", "cell": "Personal Mobile",
-    "cell phone": "Personal Mobile", "phone": "Home Phone", "home phone": "Home Phone",
-    "telephone": "Home Phone",
-    "city": "Address - City", "state": "Address - State", "zip": "Address - Zip / Postal Code",
-    "zip code": "Address - Zip / Postal Code", "postal code": "Address - Zip / Postal Code",
-    "postcode": "Address - Zip / Postal Code", "country": "Address - Country",
-    "address": "Address - Line 1", "address line 1": "Address - Line 1",
-    "address line 2": "Address - Line 2", "address line 3": "Address - Line 3", "street": "Address - Line 1",
-    "pay rate": "Rate 1", "hourly rate": "Rate 1", "rate": "Rate 1", "wage": "Rate 1", "wages": "Rate 1",
-    "hourly wage": "Rate 1", "salary rate": "Rate 1", "base pay": "Basis of Pay", "salary": "Basis of Pay",
-    "annual salary": "Basis of Pay", "base salary": "Basis of Pay", "gross pay": "Basis of Pay",
-    "pay basis": "Basis of Pay", "earnings": "Additional Earnings Amount",
-    "additional pay": "Additional Earnings Amount", "other pay": "Other Income", "income": "Other Income",
-    "other income": "Other Income", "gross income": "Other Income", "annual income": "Other Income",
-    "net income": "Other Income",
-    "gender": "Gender for Insurance Coverage No", "sex": "Gender for Insurance Coverage No",
-    "race": "Ethnicity/Race", "ethnicity": "Ethnicity/Race", "race ethnicity": "Ethnicity/Race",
-    "job title": "Job Title No", "title": "Job Title No", "status": "Status",
-    "employment status": "Status", "term date": "Termination Date", "termination": "Termination Date",
-    "separation date": "Termination Date", "term reason": "Termination Reason",
-    "separation reason": "Termination Reason", "reason for termination": "Termination Reason",
-    "direct deposit": "Direct Deposit - Account Number", "bank account": "Direct Deposit - Account Number",
-    "account number": "Direct Deposit - Account Number", "dd account": "Direct Deposit - Account Number",
-    "payee": "Payee",
-    "tax id": "Tax ID Type", "tin": "Tax ID Type", "taxpayer id": "Tax ID Type",
-    "defer ss": "Defer Social Security tax", "defer soc sec": "Defer Social Security tax",
-    "dependents": "Dependents No", "dependent count": "Dependents No",
-    "medical insurance": "Lien Dependent Medical Insurance", "lien": "Lien Dependent Medical Insurance",
-}
 
 
 def b11_normalise(text: str) -> str:
@@ -4360,10 +4115,9 @@ def b11_build_row(record: dict, docid: str) -> list:
     return [_csv_safe(v) for v in row]
 
 
-def b11_write_per_pdf_output(out_path: Path, change_rows, warning, template_headers=None, template_tags=None, bucket11_headers=None):
+def b11_write_per_pdf_output(out_path: Path, change_rows, warning):
     tmp_path = out_path.with_suffix(".tmp.xlsx")
     wb = openpyxl.Workbook()
-    stats = {"template_employees": 0, "matched_fields": 0, "unmatched_fields": 0}
     try:
         ws1 = wb.active
         ws1.title = "Native extracted"
@@ -4379,18 +4133,6 @@ def b11_write_per_pdf_output(out_path: Path, change_rows, warning, template_head
                 last_name = row[name_idx]
             ws1.append(row)
         _autofit(ws1)
-
-        if template_headers and bucket11_headers:
-            tmpl_rows, matched, unmatched = b11_pivot_to_template_rows(change_rows, "", template_headers, bucket11_headers)
-            stats["template_employees"] = len(tmpl_rows)
-            stats["matched_fields"] = matched
-            stats["unmatched_fields"] = unmatched
-            ws2 = wb.create_sheet("Import Template")
-            ws2.append(template_headers)
-            if template_tags:
-                ws2.append(template_tags)
-            for row_dict in tmpl_rows:
-                ws2.append([_csv_safe(row_dict.get(h, "")) for h in template_headers])
 
         if warning:
             ws_w = wb.create_sheet("Warnings")
@@ -4409,7 +4151,6 @@ def b11_write_per_pdf_output(out_path: Path, change_rows, warning, template_head
         except OSError:
             pass
         raise
-    return stats
 
 
 def b11_write_processing_report(report_path: Path, rows):
@@ -4439,127 +4180,6 @@ def b11_write_processing_report(report_path: Path, rows):
         except OSError:
             pass
         raise
-
-
-def b11_load_bucket11_headers(path: Path):
-    wb = openpyxl.load_workbook(str(path))
-    ws = wb.active
-    headers = [str(row[0]).strip() for i, row in enumerate(ws.iter_rows(values_only=True), 1) if i > 1 and row[0]]
-    wb.close()
-    return headers
-
-
-def b11_load_template(path: Path):
-    wb = openpyxl.load_workbook(str(path))
-    ws = wb.active
-    rows = list(ws.iter_rows(min_row=1, max_row=2, values_only=True))
-    headers = [str(v).strip() if v is not None else "" for v in rows[0]]
-    tags = list(rows[1]) if len(rows) > 1 else []
-    while len(tags) < len(headers):
-        tags.append(None)
-    wb.close()
-    return headers, tags
-
-
-def b11_norm_col(name: str) -> str:
-    return re.sub(r"[\s–—\-]+", " ", name or "").lower().strip()
-
-
-def b11_build_col_lookup(headers):
-    return {b11_norm_col(h): h for h in headers if h}
-
-
-def b11_fuzzy_match_header(field: str, candidates, cutoff: float = 0.65):
-    field_norm = b11_norm_col(field)
-    alias_hit = B11_ALIASES.get(field_norm)
-    if alias_hit:
-        return alias_hit
-    cand_norms = [b11_norm_col(c) for c in candidates]
-    matches = _difflib.get_close_matches(field_norm, cand_norms, n=1, cutoff=cutoff)
-    if not matches:
-        return None
-    return candidates[cand_norms.index(matches[0])]
-
-
-B11_BLANK_VALUES = {"", "no value", "n/a", "none", "null", "-", "–", "—"}
-
-
-def b11_select_value(changed_from: str, changed_to: str) -> str:
-    to_clean = changed_to.strip()
-    return changed_from.strip() if to_clean.lower() in B11_BLANK_VALUES else to_clean
-
-
-def b11_pivot_to_template_rows(change_rows, docid, template_headers, bucket11_headers):
-    col_lookup = b11_build_col_lookup(template_headers)
-
-    def _find_col(name):
-        if not name:
-            return None
-        return col_lookup.get(b11_norm_col(name))
-
-    emp_rows = {}
-    cat_acc = {}
-    matched = 0
-    unmatched = 0
-
-    for rec in change_rows:
-        emp_key = (rec.get("Associate ID", ""), rec.get("Last Name", ""), rec.get("First Name", ""))
-
-        if emp_key not in emp_rows:
-            row = {h: "" for h in template_headers}
-            row[_find_col("DOCID") or "DOCID"] = rec.get("DOCID", docid)
-            row[_find_col("Last Name") or "Last Name"] = rec.get("Last Name", "")
-            row[_find_col("First Name") or "First Name"] = rec.get("First Name", "")
-            row[_find_col("Middle Name") or "Middle Name"] = rec.get("Middle Name", "")
-            row[_find_col("Data Subject Type") or "Data Subject Type"] = "Employee"
-            eic = _find_col("Employee Identification Number")
-            if eic:
-                row[eic] = rec.get("Associate ID", "")
-            emp_rows[emp_key] = row
-            cat_acc[emp_key] = {}
-
-        row = emp_rows[emp_key]
-        cats = cat_acc[emp_key]
-
-        field = rec.get("Changed Field", "")
-        value = b11_select_value(rec.get("Changed From", ""), rec.get("Changed To", ""))
-
-        b11_hdr = b11_fuzzy_match_header(field, bucket11_headers)
-        if b11_hdr is None:
-            unmatched += 1
-            continue
-        mapping = B11_BUCKET11_MAP.get(b11_hdr)
-        if mapping is None:
-            unmatched += 1
-            continue
-
-        matched += 1
-        value_col_name, cat_col_name, cat_subitem = mapping
-
-        vcol = _find_col(value_col_name)
-        if vcol and value:
-            existing = row.get(vcol, "")
-            if not existing:
-                row[vcol] = value
-            elif value not in existing:
-                row[vcol] = existing + "; " + value
-
-        ccol = _find_col(cat_col_name)
-        if ccol and cat_subitem:
-            items = cats.setdefault(ccol, [])
-            if cat_subitem not in items:
-                items.append(cat_subitem)
-
-    for emp_key, row in emp_rows.items():
-        for ccol, items in cat_acc[emp_key].items():
-            if items:
-                existing = row.get(ccol, "")
-                for item in items:
-                    if item not in existing:
-                        existing = (existing + ";" + item) if existing else item
-                row[ccol] = existing
-
-    return list(emp_rows.values()), matched, unmatched
 
 
 def b11_selftest() -> int:
@@ -4666,21 +4286,6 @@ def cmd_bucket11(args) -> int:
             b11_diagnose(pdf_path, max_pages=args.diagnose_pages)
         return 0
 
-    script_dir = Path(__file__).parent
-    tmpl_path = Path(args.template_file) if args.template_file else script_dir / "Latest Template.xlsx"
-    bl_path = Path(args.bucket_list) if args.bucket_list else script_dir / "Bucket_11_List.xlsx"
-
-    template_headers = template_tags = bucket11_headers = None
-    if tmpl_path.exists() and bl_path.exists():
-        template_headers, template_tags = b11_load_template(tmpl_path)
-        bucket11_headers = b11_load_bucket11_headers(bl_path)
-        print(f"Template mode: {len(template_headers)} template cols, {len(bucket11_headers)} Bucket-11 headers loaded.")
-    else:
-        if not tmpl_path.exists():
-            print(f"WARNING: template file not found -- {tmpl_path} (Import Template sheet skipped)")
-        if not bl_path.exists():
-            print(f"WARNING: bucket-list not found -- {bl_path} (Import Template sheet skipped)")
-
     report_rows = []
     all_warnings = []
     output_folder = target if target.is_dir() else target.parent
@@ -4692,21 +4297,8 @@ def cmd_bucket11(args) -> int:
 
             if not args.debug:
                 out_path = _extracted_path(pdf_path, output_folder)
-                stats = b11_write_per_pdf_output(
-                    out_path, rows, rpt["warning"],
-                    template_headers=template_headers, template_tags=template_tags,
-                    bucket11_headers=bucket11_headers,
-                )
-                sheets = "Native extracted"
-                if template_headers and bucket11_headers:
-                    sheets += (f" + Import Template ({stats['template_employees']} employee(s), "
-                               f"{stats['matched_fields']} field(s) mapped")
-                    if stats["unmatched_fields"]:
-                        sheets += f", {stats['unmatched_fields']} unmatched"
-                    sheets += ")"
-                elif not template_headers:
-                    sheets += "  [Import Template skipped -- template file not loaded]"
-                print(f"  Wrote: {out_path.name}  [{sheets}]  ({len(rows)} change row(s))")
+                b11_write_per_pdf_output(out_path, rows, rpt["warning"])
+                print(f"  Wrote: {out_path.name}  ({len(rows)} change row(s))")
 
             if rpt["warning"]:
                 all_warnings.append(f"{pdf_path.name}: {rpt['warning']}")
@@ -4855,18 +4447,6 @@ def detect_format_for_file(pdf_path: Path, selected_formats: list) -> str:
     return None
 
 
-def find_any_template(folder: Path):
-    """Best-effort template auto-detect for interactive mode (1095c / gross-pay),
-    which don't prompt for a template path the way their CLI subcommands do."""
-    if not folder or not Path(folder).is_dir():
-        return None
-    candidates = [
-        p for p in Path(folder).glob("*.xlsx")
-        if not p.name.startswith("~$") and "template" in p.name.lower() and "_extracted" not in p.name.lower()
-    ]
-    return candidates[0] if len(candidates) == 1 else None
-
-
 # --- Per-file run wrappers: one call = one PDF, reusing each format's engine ---
 
 def run_w2_on_file(pdf_path: Path, output_dir, wages: bool = True) -> int:
@@ -4879,18 +4459,13 @@ def run_w2_on_file(pdf_path: Path, output_dir, wages: bool = True) -> int:
     return len(deduped)
 
 
-def run_1095c_on_file(pdf_path: Path, output_dir, template_path=None) -> int:
+def run_1095c_on_file(pdf_path: Path, output_dir) -> int:
     out_dir = Path(output_dir) if output_dir else pdf_path.parent
     records = c1095_process_pdf(pdf_path, debug=False, output_dir=out_dir)
     if not records:
         return 0
+    records = c1095_dedupe_complete_rows(records)
     c1095_build_workbook(records).save(_extracted_path(pdf_path, output_dir))
-    if template_path and Path(template_path).exists():
-        try:
-            c1095_build_template_workbook(template_path, records, pdf_path.name).save(
-                _extracted_path(pdf_path, output_dir, "_extracted_template.xlsx"))
-        except Exception as exc:
-            print(f"  [1095c] template-mapped output skipped for {pdf_path.name}: {exc}")
     return len(records)
 
 
@@ -4924,26 +4499,19 @@ def run_patient_info_on_file(pdf_path: Path, output_dir) -> int:
     return len(rows)
 
 
-def run_gross_pay_on_file(pdf_path: Path, output_dir, template_path=None) -> int:
+def run_gross_pay_on_file(pdf_path: Path, output_dir) -> int:
     records = gp_process_pdf(pdf_path)
     if not records:
         return 0
     for r in records:
         r["Doc ID"] = pdf_path.name
     gp_build_extracted_workbook(records).save(_extracted_path(pdf_path, output_dir))
-    if template_path and Path(template_path).exists():
-        try:
-            gp_build_template_workbook(template_path, records).save(
-                _extracted_path(pdf_path, output_dir, "_extracted_template.xlsx"))
-        except Exception as exc:
-            print(f"  [gross-pay] template-mapped output skipped for {pdf_path.name}: {exc}")
     return len(records)
 
 
-def run_401k_on_file(pdf_path: Path, output_dir, template_path=None) -> int:
+def run_401k_on_file(pdf_path: Path, output_dir) -> int:
     records = k401_extract(pdf_path, pdf_path.stem)
-    k401_write_workbook(_extracted_path(pdf_path, output_dir), records,
-                         Path(template_path) if template_path else None)
+    k401_write_workbook(_extracted_path(pdf_path, output_dir), records)
     return len(records)
 
 
@@ -4961,66 +4529,34 @@ def run_generic_on_file(pdf_path: Path, output_dir) -> int:
     return len(sections) + sum(len(t["rows"]) for t in tables) + len(form_fields)
 
 
-def run_bucket11_on_file(pdf_path: Path, output_dir, template_headers=None, template_tags=None, bucket11_headers=None) -> int:
+def run_bucket11_on_file(pdf_path: Path, output_dir) -> int:
     change_rows, warning, _pages = b11_extract_changes(pdf_path, debug=False)
     for rec in change_rows:
         rec["DOCID"] = pdf_path.name
-    b11_write_per_pdf_output(_extracted_path(pdf_path, output_dir), change_rows, warning,
-                              template_headers, template_tags, bucket11_headers)
+    b11_write_per_pdf_output(_extracted_path(pdf_path, output_dir), change_rows, warning)
     return len(change_rows)
 
 
-def run_detected_format(fmt: str, pdf_path: Path, output_dir, resolved_templates: dict) -> int:
+def run_detected_format(fmt: str, pdf_path: Path, output_dir) -> int:
     if fmt == "w2":
         return run_w2_on_file(pdf_path, output_dir)
     if fmt == "1095c":
-        return run_1095c_on_file(pdf_path, output_dir, resolved_templates.get("1095c"))
+        return run_1095c_on_file(pdf_path, output_dir)
     if fmt == "claims":
         return run_claims_on_file(pdf_path, output_dir)
     if fmt == "patient-info":
         return run_patient_info_on_file(pdf_path, output_dir)
     if fmt == "gross-pay":
-        return run_gross_pay_on_file(pdf_path, output_dir, resolved_templates.get("gross-pay"))
+        return run_gross_pay_on_file(pdf_path, output_dir)
     if fmt == "401k":
-        return run_401k_on_file(pdf_path, output_dir, resolved_templates.get("401k"))
+        return run_401k_on_file(pdf_path, output_dir)
     if fmt == "creditor-list":
         return run_creditor_list_on_file(pdf_path, output_dir)
     if fmt == "generic":
         return run_generic_on_file(pdf_path, output_dir)
     if fmt == "bucket11":
-        tmpl = resolved_templates.get("bucket11") or (None, None, None)
-        return run_bucket11_on_file(pdf_path, output_dir, *tmpl)
+        return run_bucket11_on_file(pdf_path, output_dir)
     return 0
-
-
-def resolve_templates_for_formats(selected_formats: list, search_dir: Path) -> dict:
-    """Best-effort, non-fatal template auto-detection per format, run once
-    per interactive session rather than per file."""
-    resolved = {}
-    script_dir = Path(__file__).parent
-
-    if "1095c" in selected_formats or "gross-pay" in selected_formats:
-        tmpl = find_any_template(search_dir)
-        if "1095c" in selected_formats:
-            resolved["1095c"] = tmpl
-        if "gross-pay" in selected_formats:
-            resolved["gross-pay"] = tmpl
-
-    if "401k" in selected_formats:
-        candidates = [script_dir / "Latest Template.xlsx", search_dir / "Latest Template.xlsx"]
-        resolved["401k"] = next((p for p in candidates if p.exists()), None)
-
-    if "bucket11" in selected_formats:
-        tmpl_path = script_dir / "Latest Template.xlsx"
-        bl_path = script_dir / "Bucket_11_List.xlsx"
-        if tmpl_path.exists() and bl_path.exists():
-            headers, tags = b11_load_template(tmpl_path)
-            b11_headers = b11_load_bucket11_headers(bl_path)
-            resolved["bucket11"] = (headers, tags, b11_headers)
-        else:
-            resolved["bucket11"] = (None, None, None)
-
-    return resolved
 
 
 def run_interactive_dispatch(selected_formats: list, input_path: Path, output_dir) -> None:
@@ -5028,9 +4564,6 @@ def run_interactive_dispatch(selected_formats: list, input_path: Path, output_di
     if not pdf_files:
         print(f"No PDF files found at: {input_path}")
         return
-
-    search_dir = input_path if input_path.is_dir() else input_path.parent
-    resolved_templates = resolve_templates_for_formats(selected_formats, search_dir)
 
     print(f"Selected format(s): {', '.join(FORMAT_LABELS[f] for f in selected_formats)}")
     print(f"Found {len(pdf_files)} PDF file(s). Detecting format per file...\n")
@@ -5044,7 +4577,7 @@ def run_interactive_dispatch(selected_formats: list, input_path: Path, output_di
             unmatched.append(pdf_path.name)
             continue
         try:
-            n = run_detected_format(fmt, pdf_path, output_dir, resolved_templates)
+            n = run_detected_format(fmt, pdf_path, output_dir)
         except Exception as exc:
             print(f"  [{fmt}] ERROR on {pdf_path.name}: {exc}")
             continue
@@ -5192,7 +4725,6 @@ def build_parser() -> argparse.ArgumentParser:
 
     p = sub.add_parser("1095c", help="Extract employee identity/address fields from IRS Form 1095-C PDFs")
     p.add_argument("input", help="PDF file or folder of PDFs")
-    p.add_argument("template", help="Path to BDE Import Template.xlsx (read only, never modified)")
     _add_common_args(p, recursive=False)
     p.add_argument("--debug", action="store_true",
                    help="Also write <pdf>_debug.txt (line-numbered page text) to the output dir")
@@ -5213,14 +4745,11 @@ def build_parser() -> argparse.ArgumentParser:
     p = sub.add_parser("gross-pay", help="Extract Employee Gross-To-Net report data from PDFs")
     p.add_argument("input", help="PDF file or folder of PDFs")
     _add_common_args(p, recursive=False)
-    p.add_argument("--template", default=None,
-                   help="Path to BDE Import Template.xlsx (auto-detected in the input folder if omitted)")
     p.set_defaults(func=cmd_gross_pay)
 
-    p = sub.add_parser("401k", help="Extract employee 401k data into the standard PII template format")
+    p = sub.add_parser("401k", help="Extract employee 401k data into the standard PII column format")
     p.add_argument("target", nargs="?", help="PDF file or folder (prompted if omitted)")
     _add_common_args(p)
-    p.add_argument("--template", default=None, help="Path to Latest Template.xlsx (auto-detected if omitted)")
     p.set_defaults(func=cmd_401k)
 
     p = sub.add_parser("creditor-list", help="Extract creditor names/addresses from bankruptcy mailing-matrix PDFs")
@@ -5240,10 +4769,6 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--diagnose", action="store_true", help="Dump raw PDF text and column detection to stdout")
     p.add_argument("--diagnose-pages", type=int, default=3, metavar="N")
     p.add_argument("--selftest", action="store_true", help="Run built-in parser tests and exit")
-    p.add_argument("--template-file", metavar="XLSX",
-                   help="Latest Template xlsx; when provided, also write the Import Template sheet")
-    p.add_argument("--bucket-list", metavar="XLSX",
-                   help="Bucket-11 header list xlsx (default: Bucket_11_List.xlsx beside this script)")
     p.set_defaults(func=cmd_bucket11)
 
     return parser
