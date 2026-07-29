@@ -1,5 +1,5 @@
 r"""
-bucket_11.py — Extract Employee Payroll Changes from ADP "Employee Payroll Changes" PDFs.
+employee_ADP.py — Extract Employee Payroll Changes from ADP "Employee Payroll Changes" PDFs.
 
 Document structure
 ------------------
@@ -22,11 +22,11 @@ Output — one row per change entry per employee:
     Changed Field | Changed From | Changed To
 
 USAGE
-    python bucket_11.py "C:\path\to\file.pdf"
-    python bucket_11.py "C:\path\to\folder" --recursive
-    python bucket_11.py "C:\path\to\file.pdf" --debug
-    python bucket_11.py "C:\path\to\file.pdf" --diagnose [--diagnose-pages N]
-    python bucket_11.py --selftest
+    python employee_ADP.py "C:\path\to\file.pdf"
+    python employee_ADP.py "C:\path\to\folder" --recursive
+    python employee_ADP.py "C:\path\to\file.pdf" --debug
+    python employee_ADP.py "C:\path\to\file.pdf" --diagnose [--diagnose-pages N]
+    python employee_ADP.py --selftest
 """
 
 from __future__ import annotations
