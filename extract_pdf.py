@@ -17,6 +17,15 @@ USAGE
 DEPENDENCIES
     pip install pdfplumber openpyxl
     (pdfplumber pulls in pdfminer.six automatically)
+
+    For scanned / image-only PDFs (OCR support), also install:
+        pip install pymupdf pytesseract Pillow
+    ...and the Tesseract-OCR engine itself (a separate binary, not a pip
+    package):
+        Windows : https://github.com/UB-Mannheim/tesseract/wiki
+        macOS   : brew install tesseract
+        Linux   : apt install tesseract-ocr
+    If tesseract.exe is not on PATH, point at it with --tesseract-cmd.
 """
 
 from __future__ import annotations
@@ -48,6 +57,21 @@ try:
     HAS_OPENPYXL = True
 except ImportError:
     HAS_OPENPYXL = False
+
+try:
+    import fitz  # PyMuPDF — used to rasterize pages for OCR
+    HAS_FITZ = True
+except ImportError:
+    HAS_FITZ = False
+
+try:
+    import pytesseract
+    from PIL import Image
+    HAS_OCR_LIBS = True
+except ImportError:
+    HAS_OCR_LIBS = False
+
+HAS_OCR = HAS_FITZ and HAS_OCR_LIBS
 
 
 # ---------------------------------------------------------------------------
@@ -126,6 +150,77 @@ def _word_is_header(word: dict, median_size: float) -> bool:
 
 
 # ---------------------------------------------------------------------------
+# OCR support — scanned / image-only pages
+# ---------------------------------------------------------------------------
+
+OCR_DPI = 300
+OCR_MIN_CHARS = 20   # pages with less embedded text than this are treated as scanned
+
+
+def _page_needs_ocr(page) -> bool:
+    """True when a page has (near) no embedded text layer, i.e. it's a scanned image."""
+    try:
+        text = page.extract_text() or ""
+    except Exception:
+        text = ""
+    return len(text.strip()) < OCR_MIN_CHARS
+
+
+def _ocr_words_for_page(pdf_path: Path, page_num: int, dpi: int = OCR_DPI) -> list[dict]:
+    """
+    Rasterize one page with PyMuPDF and run Tesseract OCR to recover word-level
+    text with bounding boxes, in the same top-left-origin point coordinate
+    system pdfplumber uses (so the words can flow through the existing
+    section/label heuristics unchanged).
+    """
+    if not HAS_OCR:
+        return []
+
+    try:
+        doc = fitz.open(str(pdf_path))
+        try:
+            page = doc.load_page(page_num - 1)
+            zoom = dpi / 72.0
+            pix = page.get_pixmap(matrix=fitz.Matrix(zoom, zoom), alpha=False)
+            img = Image.frombytes("RGB", (pix.width, pix.height), pix.samples)
+        finally:
+            doc.close()
+    except Exception:
+        return []
+
+    try:
+        data = pytesseract.image_to_data(img, output_type=pytesseract.Output.DICT)
+    except Exception:
+        return []
+
+    words: list[dict] = []
+    for i in range(len(data.get("text", []))):
+        text = str(data["text"][i]).strip()
+        if not text:
+            continue
+        try:
+            if float(data["conf"][i]) < 0:
+                continue
+        except (TypeError, ValueError, KeyError):
+            pass
+        try:
+            left   = float(data["left"][i]) / zoom
+            top    = float(data["top"][i]) / zoom
+            width  = float(data["width"][i]) / zoom
+            height = float(data["height"][i]) / zoom
+        except (TypeError, ValueError, KeyError):
+            continue
+        words.append({
+            "text":   text,
+            "x0":     left,
+            "x1":     left + width,
+            "top":    top,
+            "bottom": top + height,
+        })
+    return words
+
+
+# ---------------------------------------------------------------------------
 # Per-page extraction
 # ---------------------------------------------------------------------------
 
@@ -142,7 +237,7 @@ def _word_in_bbox(word: dict, bboxes: list[tuple]) -> bool:
     return False
 
 
-def _extract_page_sections(page, table_bboxes: list[tuple]) -> list[dict]:
+def _extract_page_sections(page, table_bboxes: list[tuple], ocr_words: list[dict] | None = None) -> list[dict]:
     """
     Return a list of {"header": str, "value": str} dicts from one page.
 
@@ -150,9 +245,13 @@ def _extract_page_sections(page, table_bboxes: list[tuple]) -> list[dict]:
     table content never leaks into the Sections sheet.
 
     Strategy A: use word-level font metadata to separate headers from body text.
-    Strategy B (fallback): line-by-line heuristics when font metadata is absent.
+    Strategy B (fallback): line-by-line heuristics when font metadata is absent
+    — this is also the path taken for OCR'd words, which carry no font info.
     """
-    all_words = page.extract_words(extra_attrs=["fontname", "size"])
+    if ocr_words is not None:
+        all_words = ocr_words
+    else:
+        all_words = page.extract_words(extra_attrs=["fontname", "size"])
     # Exclude words that belong to a table region
     words = [w for w in all_words if not _word_in_bbox(w, table_bboxes)]
 
@@ -633,7 +732,7 @@ def extract_form_fields(pdf_path: Path) -> list[dict]:
 # Full PDF extraction
 # ---------------------------------------------------------------------------
 
-def extract_pdf(pdf_path: Path) -> tuple[list[dict], list[dict], list[dict]]:
+def extract_pdf(pdf_path: Path, ocr_dpi: int = OCR_DPI) -> tuple[list[dict], list[dict], list[dict]]:
     """
     Returns:
         sections     — list of {"source", "page", "header", "value"}
@@ -646,11 +745,25 @@ def extract_pdf(pdf_path: Path) -> tuple[list[dict], list[dict], list[dict]]:
 
     with pdfplumber.open(str(pdf_path)) as pdf:
         for page_num, page in enumerate(pdf.pages, start=1):
-            # 1. Detect tables first so we know which areas to mask from text
+            # 1. Detect tables first so we know which areas to mask from text.
+            #    Scanned pages have no text layer for find_tables() to use, so
+            #    this naturally yields no bboxes/records for them.
             bboxes, tbl_records = _extract_page_tables(page)
 
+            # 1b. Scanned / image-only page → OCR it to recover a text layer
+            ocr_words = None
+            if _page_needs_ocr(page):
+                if HAS_OCR:
+                    ocr_words = _ocr_words_for_page(pdf_path, page_num, dpi=ocr_dpi)
+                    if ocr_words:
+                        print(f"    OCR applied on page {page_num} ({source})")
+                else:
+                    print(f"    WARNING: page {page_num} of {source} looks like a scanned "
+                          "image but OCR libraries are missing — skipping. "
+                          "Run: pip install pymupdf pytesseract Pillow (and install Tesseract-OCR).")
+
             # 2. Extract sections, excluding table regions
-            page_sections = _extract_page_sections(page, bboxes)
+            page_sections = _extract_page_sections(page, bboxes, ocr_words=ocr_words)
             for sec in page_sections:
                 all_sections.append({
                     "source": source,
@@ -881,6 +994,15 @@ def main() -> int:
         "--output", default=None,
         help="Custom output .xlsx path (default: next to target)"
     )
+    parser.add_argument(
+        "--ocr-dpi", type=int, default=OCR_DPI,
+        help=f"Resolution used to rasterize scanned pages before OCR (default: {OCR_DPI})"
+    )
+    parser.add_argument(
+        "--tesseract-cmd", default=None,
+        help=r"Full path to tesseract.exe, if it isn't on PATH "
+             r"(e.g. C:\Program Files\Tesseract-OCR\tesseract.exe)"
+    )
     args = parser.parse_args()
 
     target_str = args.target
@@ -896,6 +1018,24 @@ def main() -> int:
     if not HAS_PYPDF:
         print("WARNING: pypdf not installed — form field values will be skipped.\n"
               "         Run:  pip install pypdf")
+
+    if args.tesseract_cmd and HAS_OCR_LIBS:
+        pytesseract.pytesseract.tesseract_cmd = args.tesseract_cmd
+
+    if not HAS_OCR:
+        missing = []
+        if not HAS_FITZ:
+            missing.append("pymupdf")
+        if not HAS_OCR_LIBS:
+            missing.append("pytesseract Pillow")
+        print(f"WARNING: OCR support unavailable (missing: pip install {' '.join(missing)}).\n"
+              "         Scanned / image-only PDF pages will be skipped.")
+    else:
+        try:
+            pytesseract.get_tesseract_version()
+        except Exception:
+            print("WARNING: Tesseract-OCR engine not found on PATH — scanned pages will be "
+                  "skipped.\n         Install it (see file header) or pass --tesseract-cmd.")
 
     target = Path(target_str)
     if not target.exists():
@@ -914,7 +1054,7 @@ def main() -> int:
     for pdf_path in files:
         print(f"  Processing: {pdf_path.name}")
         try:
-            sections, tables, form_fields = extract_pdf(pdf_path)
+            sections, tables, form_fields = extract_pdf(pdf_path, ocr_dpi=args.ocr_dpi)
             all_sections.extend(sections)
             all_tables.extend(tables)
             all_form_fields.extend(form_fields)
