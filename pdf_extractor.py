@@ -19,6 +19,18 @@
 
    (tkinter comes with Python on Windows - no install needed)
 
+ OCR FOR SCANNED PDFS (optional, only needed for image-only PDFs)
+ -----------------------------------------------------------------
+   1. pip install pymupdf pytesseract pillow
+   2. Install the Tesseract OCR engine (separate program, not pip):
+        Windows : https://github.com/UB-Mannheim/tesseract/wiki
+                  (installs to C:\\Program Files\\Tesseract-OCR by default)
+        macOS   : brew install tesseract
+        Linux   : sudo apt install tesseract-ocr
+   3. In the app, tick "Enable OCR for scanned pages" before starting.
+      Pages that already contain real text are read normally (fast);
+      only pages with no extractable text are sent through OCR (slower).
+
  HOW TO RUN
  ----------
    1. Open Command Prompt in the script folder (or use full path)
@@ -28,6 +40,7 @@
         - Click [Browse...] and select the folder with your PDFs
         - Choose extraction mode (Text / Tables / Both)
         - Choose date format for the output file name
+        - Optionally tick "Enable OCR for scanned pages"
         - Click [START EXTRACTION]
    4. Watch progress in the log window.
       When done, the output path is shown and the folder can be opened.
@@ -40,6 +53,7 @@
 
 import os
 import re
+import shutil
 import threading
 import subprocess
 import sys
@@ -50,6 +64,19 @@ from tkinter import ttk, filedialog, messagebox
 
 import pdfplumber
 import pandas as pd
+
+# ---- Optional OCR dependencies (only needed for scanned/image PDFs) ----
+try:
+    import fitz  # PyMuPDF - renders PDF pages to images without Poppler/ImageMagick
+except ImportError:
+    fitz = None
+
+try:
+    import pytesseract
+    from PIL import Image
+except ImportError:
+    pytesseract = None
+    Image = None
 
 # Excel rejects some control characters - remove them safely
 ILLEGAL = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f]")
@@ -62,44 +89,132 @@ def clean(value):
 
 
 # =====================================================================
+#  OCR HELPERS (for scanned / image-only PDF pages)
+# =====================================================================
+def configure_tesseract():
+    """Try to locate the Tesseract OCR binary. Returns True if usable."""
+    if pytesseract is None:
+        return False
+    cmd = pytesseract.pytesseract.tesseract_cmd
+    if cmd and os.path.isfile(cmd):
+        return True
+    for candidate in (
+        r"C:\Program Files\Tesseract-OCR\tesseract.exe",
+        r"C:\Program Files (x86)\Tesseract-OCR\tesseract.exe",
+    ):
+        if os.path.isfile(candidate):
+            pytesseract.pytesseract.tesseract_cmd = candidate
+            return True
+    return shutil.which("tesseract") is not None
+
+
+def ocr_available():
+    """True if all pieces needed for OCR fallback are installed."""
+    return fitz is not None and pytesseract is not None and configure_tesseract()
+
+
+def render_page_image(fitz_doc, page_num, dpi=300):
+    """Render one page (1-indexed) of an open fitz document to a PIL image."""
+    page = fitz_doc[page_num - 1]
+    zoom = dpi / 72
+    pix = page.get_pixmap(matrix=fitz.Matrix(zoom, zoom))
+    return Image.frombytes("RGB", (pix.width, pix.height), pix.samples)
+
+
+def ocr_page_text(fitz_doc, page_num, dpi=300):
+    """OCR one page and return the recognized text (may be empty)."""
+    img = render_page_image(fitz_doc, page_num, dpi)
+    return pytesseract.image_to_string(img)
+
+
+# =====================================================================
 #  EXTRACTION LOGIC
 # =====================================================================
-def extract_text_rows(pdf_path, pdf_file, log, progress_page):
-    """Each line = one row. layout=True keeps spacing as in the PDF."""
+def extract_text_rows(pdf_path, pdf_file, log, progress_page, use_ocr=False, ocr_dpi=300):
+    """Each line = one row. layout=True keeps spacing as in the PDF.
+
+    If a page has no extractable text (typical of a scanned/image PDF)
+    and use_ocr is enabled, the page is rendered to an image and OCR'd.
+    """
     rows = []
+    fitz_doc = None
+    if use_ocr:
+        try:
+            fitz_doc = fitz.open(pdf_path)
+        except Exception as e:
+            log(f"   [OCR] Could not open PDF for OCR rendering: {e}")
+
     with pdfplumber.open(pdf_path) as pdf:
         total = len(pdf.pages)
         for page_num, page in enumerate(pdf.pages, start=1):
             progress_page(page_num, total)
             try:
                 text = page.extract_text(layout=True)  # preserve spaces
-                if text:
-                    for line in text.split("\n"):
-                        line = line.rstrip()  # keep LEADING spaces
-                        if line:
-                            rows.append({
-                                "File Name": pdf_file,
-                                "Page Number": page_num,
-                                "Extracted Text": clean(line),
-                            })
+                lines = text.split("\n") if text else []
+                if not any(line.strip() for line in lines) and fitz_doc is not None:
+                    log(f"   [OCR] Page {page_num}: no embedded text - running OCR...")
+                    try:
+                        ocr_text = ocr_page_text(fitz_doc, page_num, ocr_dpi)
+                        lines = ocr_text.split("\n") if ocr_text else []
+                    except Exception as e:
+                        log(f"   [OCR ERROR] page {page_num}: {e}")
+                        lines = []
+                for line in lines:
+                    line = line.rstrip()  # keep LEADING spaces
+                    if line:
+                        rows.append({
+                            "File Name": pdf_file,
+                            "Page Number": page_num,
+                            "Extracted Text": clean(line),
+                        })
             except Exception as e:
                 log(f"   [ERROR] Text - page {page_num}: {e}")
+
+    if fitz_doc is not None:
+        fitz_doc.close()
     return rows
 
 
-def extract_table_rows(pdf_path, pdf_file, log, progress_page):
-    """Every table row = one output row."""
+def extract_table_rows(pdf_path, pdf_file, log, progress_page, use_ocr=False, ocr_dpi=300):
+    """Every table row = one output row.
+
+    If a page has no detectable table and use_ocr is enabled, the page is
+    OCR'd and each recognized line is added as a single-column fallback row.
+    """
     rows = []
+    fitz_doc = None
+    if use_ocr:
+        try:
+            fitz_doc = fitz.open(pdf_path)
+        except Exception as e:
+            log(f"   [OCR] Could not open PDF for OCR rendering: {e}")
+
     with pdfplumber.open(pdf_path) as pdf:
         total = len(pdf.pages)
         for page_num, page in enumerate(pdf.pages, start=1):
             progress_page(page_num, total)
             try:
-                for table in page.extract_tables():
-                    for row in table:
-                        rows.append([pdf_file, page_num] + [clean(c) for c in row])
+                tables = page.extract_tables()
+                if tables:
+                    for table in tables:
+                        for row in table:
+                            rows.append([pdf_file, page_num] + [clean(c) for c in row])
+                elif fitz_doc is not None:
+                    log(f"   [OCR] Page {page_num}: no table detected - running OCR fallback...")
+                    try:
+                        ocr_text = ocr_page_text(fitz_doc, page_num, ocr_dpi)
+                    except Exception as e:
+                        log(f"   [OCR ERROR] page {page_num}: {e}")
+                        ocr_text = ""
+                    for line in (ocr_text.split("\n") if ocr_text else []):
+                        line = line.rstrip()
+                        if line:
+                            rows.append([pdf_file, page_num, clean(line)])
             except Exception as e:
                 log(f"   [ERROR] Tables - page {page_num}: {e}")
+
+    if fitz_doc is not None:
+        fitz_doc.close()
     return rows
 
 
@@ -116,6 +231,7 @@ class PDFExtractorApp:
         self.folder_var = tk.StringVar()
         self.mode_var = tk.StringVar(value="text")
         self.datefmt_var = tk.StringVar(value="%m%d%Y")
+        self.ocr_var = tk.BooleanVar(value=False)
         self.running = False
         self.output_path = None
 
@@ -146,6 +262,15 @@ class PDFExtractorApp:
                         variable=self.datefmt_var, value="%m%d%Y").pack(anchor="w", padx=15, pady=2)
         ttk.Radiobutton(frm_date, text="DDMMYYYY  (e.g. FolderName_04072026.xlsx)",
                         variable=self.datefmt_var, value="%d%m%Y").pack(anchor="w", padx=15, pady=(2, 8))
+
+        # ---- 3b) OCR option ------------------------------------------
+        frm_ocr = ttk.LabelFrame(root, text=" 4. Scanned PDFs ")
+        frm_ocr.pack(fill="x", **pad)
+        ttk.Checkbutton(
+            frm_ocr,
+            text="Enable OCR for scanned pages (slower, requires Tesseract OCR installed)",
+            variable=self.ocr_var,
+        ).pack(anchor="w", padx=15, pady=(2, 8))
 
         # ---- 4) Run button + progress -------------------------------
         frm_run = ttk.Frame(root)
@@ -226,6 +351,17 @@ class PDFExtractorApp:
         self.log("=" * 60)
         self.log(f"Starting extraction | Mode: {mode.upper()} | Files: {len(pdf_files)}")
 
+        use_ocr = self.ocr_var.get()
+        if use_ocr:
+            if ocr_available():
+                self.log("OCR enabled - scanned pages will be recognized via Tesseract.")
+            else:
+                use_ocr = False
+                self.log("[WARNING] OCR was requested but is not available.")
+                self.log("          Install with: pip install pymupdf pytesseract pillow")
+                self.log("          and install the Tesseract OCR engine, then restart.")
+                self.log("          Continuing WITHOUT OCR - scanned pages will be skipped.")
+
         for idx, pdf_file in enumerate(pdf_files, start=1):
             pdf_path = os.path.join(folder, pdf_file)
             self.log(f"\n[{idx}/{len(pdf_files)}] Processing: {pdf_file}")
@@ -236,11 +372,13 @@ class PDFExtractorApp:
 
             try:
                 if mode in ("text", "both"):
-                    rows = extract_text_rows(pdf_path, pdf_file, self.log, page_progress)
+                    rows = extract_text_rows(pdf_path, pdf_file, self.log, page_progress,
+                                              use_ocr=use_ocr)
                     text_records.extend(rows)
                     self.log(f"   Text lines extracted : {len(rows)}")
                 if mode in ("tables", "both"):
-                    rows = extract_table_rows(pdf_path, pdf_file, self.log, page_progress)
+                    rows = extract_table_rows(pdf_path, pdf_file, self.log, page_progress,
+                                               use_ocr=use_ocr)
                     table_records.extend(rows)
                     self.log(f"   Table rows extracted : {len(rows)}")
             except Exception as e:
