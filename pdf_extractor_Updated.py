@@ -44,6 +44,7 @@ import threading
 import subprocess
 import sys
 from datetime import datetime
+from concurrent.futures import ThreadPoolExecutor
 
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
@@ -53,6 +54,10 @@ import pandas as pd
 
 # Excel rejects some control characters - remove them safely
 ILLEGAL = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f]")
+
+# PDFs with more pages than this are split across threads for faster extraction
+LARGE_PDF_PAGE_THRESHOLD = 2000
+EXTRACTION_THREAD_COUNT = 5
 
 
 def clean(value):
@@ -64,43 +69,97 @@ def clean(value):
 # =====================================================================
 #  EXTRACTION LOGIC
 # =====================================================================
-def extract_text_rows(pdf_path, pdf_file, log, progress_page):
+def _chunk_ranges(total, num_chunks):
+    """Split page count 'total' into up to num_chunks contiguous (start, end) ranges (0-based, end exclusive)."""
+    num_chunks = max(1, min(num_chunks, total))
+    chunk_size = (total + num_chunks - 1) // num_chunks
+    ranges = []
+    start = 0
+    while start < total:
+        end = min(start + chunk_size, total)
+        ranges.append((start, end))
+        start = end
+    return ranges
+
+
+def _process_text_pages(pdf, pdf_file, log, progress_page, total, page_numbers):
     """Each line = one row. layout=True keeps spacing as in the PDF."""
     rows = []
+    for page_num in page_numbers:
+        page = pdf.pages[page_num - 1]
+        progress_page(page_num, total)
+        try:
+            text = page.extract_text(layout=True)  # preserve spaces
+            if text:
+                for line in text.split("\n"):
+                    line = line.rstrip()  # keep LEADING spaces
+                    if line:
+                        rows.append({
+                            "File Name": pdf_file,
+                            "Page Number": page_num,
+                            "Extracted Text": clean(line),
+                        })
+        except Exception as e:
+            log(f"   [ERROR] Text - page {page_num}: {e}")
+    return rows
+
+
+def _process_table_pages(pdf, pdf_file, log, progress_page, total, page_numbers):
+    """Every table row = one output row."""
+    rows = []
+    for page_num in page_numbers:
+        page = pdf.pages[page_num - 1]
+        progress_page(page_num, total)
+        try:
+            for table in page.extract_tables():
+                for row in table:
+                    rows.append([pdf_file, page_num] + [clean(c) for c in row])
+        except Exception as e:
+            log(f"   [ERROR] Tables - page {page_num}: {e}")
+    return rows
+
+
+def _extract_threaded(pdf_path, pdf_file, log, progress_page, total, page_processor):
+    """Split 'total' pages into EXTRACTION_THREAD_COUNT chunks, each processed by its
+    own thread (each opens its own pdfplumber handle on the same file), then merges
+    the per-chunk rows back together in page order."""
+    ranges = _chunk_ranges(total, EXTRACTION_THREAD_COUNT)
+    log(f"   [INFO] {total} pages - using {len(ranges)} threads for extraction")
+    results = [None] * len(ranges)
+
+    def worker(chunk_index, start, end):
+        with pdfplumber.open(pdf_path) as pdf:
+            results[chunk_index] = page_processor(
+                pdf, pdf_file, log, progress_page, total, range(start + 1, end + 1))
+
+    with ThreadPoolExecutor(max_workers=len(ranges)) as executor:
+        futures = [executor.submit(worker, i, start, end)
+                   for i, (start, end) in enumerate(ranges)]
+        for future in futures:
+            future.result()
+
+    rows = []
+    for chunk_rows in results:
+        rows.extend(chunk_rows)
+    return rows
+
+
+def extract_text_rows(pdf_path, pdf_file, log, progress_page):
     with pdfplumber.open(pdf_path) as pdf:
         total = len(pdf.pages)
-        for page_num, page in enumerate(pdf.pages, start=1):
-            progress_page(page_num, total)
-            try:
-                text = page.extract_text(layout=True)  # preserve spaces
-                if text:
-                    for line in text.split("\n"):
-                        line = line.rstrip()  # keep LEADING spaces
-                        if line:
-                            rows.append({
-                                "File Name": pdf_file,
-                                "Page Number": page_num,
-                                "Extracted Text": clean(line),
-                            })
-            except Exception as e:
-                log(f"   [ERROR] Text - page {page_num}: {e}")
-    return rows
+    if total > LARGE_PDF_PAGE_THRESHOLD:
+        return _extract_threaded(pdf_path, pdf_file, log, progress_page, total, _process_text_pages)
+    with pdfplumber.open(pdf_path) as pdf:
+        return _process_text_pages(pdf, pdf_file, log, progress_page, total, range(1, total + 1))
 
 
 def extract_table_rows(pdf_path, pdf_file, log, progress_page):
-    """Every table row = one output row."""
-    rows = []
     with pdfplumber.open(pdf_path) as pdf:
         total = len(pdf.pages)
-        for page_num, page in enumerate(pdf.pages, start=1):
-            progress_page(page_num, total)
-            try:
-                for table in page.extract_tables():
-                    for row in table:
-                        rows.append([pdf_file, page_num] + [clean(c) for c in row])
-            except Exception as e:
-                log(f"   [ERROR] Tables - page {page_num}: {e}")
-    return rows
+    if total > LARGE_PDF_PAGE_THRESHOLD:
+        return _extract_threaded(pdf_path, pdf_file, log, progress_page, total, _process_table_pages)
+    with pdfplumber.open(pdf_path) as pdf:
+        return _process_table_pages(pdf, pdf_file, log, progress_page, total, range(1, total + 1))
 
 
 # =====================================================================
