@@ -43,6 +43,7 @@ import re
 import threading
 import subprocess
 import sys
+import time
 from datetime import datetime
 from concurrent.futures import ThreadPoolExecutor
 
@@ -64,6 +65,20 @@ def clean(value):
     if isinstance(value, str):
         return ILLEGAL.sub("", value)
     return value
+
+
+def format_eta(seconds):
+    """Format a remaining-seconds estimate as e.g. '1h 04m 30s'."""
+    if seconds is None or seconds < 0:
+        return "calculating..."
+    seconds = int(seconds)
+    hours, remainder = divmod(seconds, 3600)
+    minutes, secs = divmod(remainder, 60)
+    if hours:
+        return f"{hours}h {minutes:02d}m {secs:02d}s"
+    if minutes:
+        return f"{minutes}m {secs:02d}s"
+    return f"{secs}s"
 
 
 # =====================================================================
@@ -177,6 +192,7 @@ class PDFExtractorApp:
         self.datefmt_var = tk.StringVar(value="%m%d%Y")
         self.running = False
         self.output_path = None
+        self._eta_lock = threading.Lock()
 
         pad = {"padx": 10, "pady": 5}
 
@@ -281,17 +297,55 @@ class PDFExtractorApp:
 
     def run_extraction(self, folder, pdf_files):
         mode = self.mode_var.get()
+        # "both" mode makes two full passes over every file's pages (text + tables)
+        ops_per_file = 2 if mode == "both" else 1
         text_records, table_records = [], []
         self.log("=" * 60)
         self.log(f"Starting extraction | Mode: {mode.upper()} | Files: {len(pdf_files)}")
+
+        # Pre-scan page counts so folder-wide ETA has a total to work against
+        self.log("Scanning page counts for ETA...")
+        page_counts = {}
+        for pdf_file in pdf_files:
+            try:
+                with pdfplumber.open(os.path.join(folder, pdf_file)) as pdf:
+                    page_counts[pdf_file] = len(pdf.pages)
+            except Exception as e:
+                self.log(f"   [WARN] Could not read page count for {pdf_file}: {e}")
+                page_counts[pdf_file] = 0
+        total_units_folder = sum(page_counts.values()) * ops_per_file
+
+        folder_start = time.time()
+        pages_done_folder = [0]
 
         for idx, pdf_file in enumerate(pdf_files, start=1):
             pdf_path = os.path.join(folder, pdf_file)
             self.log(f"\n[{idx}/{len(pdf_files)}] Processing: {pdf_file}")
             self.set_status(f"Processing {idx}/{len(pdf_files)}: {pdf_file}")
 
-            def page_progress(p, total, name=pdf_file, i=idx):
-                self.set_status(f"[{i}/{len(pdf_files)}] {name} - page {p}/{total}")
+            file_start = time.time()
+            pages_done_file = [0]
+            total_units_file = page_counts.get(pdf_file, 0) * ops_per_file
+
+            def page_progress(p, total, name=pdf_file, i=idx,
+                               file_start=file_start, total_units_file=total_units_file):
+                with self._eta_lock:
+                    pages_done_file[0] += 1
+                    pages_done_folder[0] += 1
+                    done_file = pages_done_file[0]
+                    done_folder = pages_done_folder[0]
+
+                elapsed_file = time.time() - file_start
+                rate_file = done_file / elapsed_file if elapsed_file > 0 else 0
+                eta_file = (total_units_file - done_file) / rate_file if rate_file > 0 else None
+
+                elapsed_folder = time.time() - folder_start
+                rate_folder = done_folder / elapsed_folder if elapsed_folder > 0 else 0
+                eta_folder = (total_units_folder - done_folder) / rate_folder if rate_folder > 0 else None
+
+                self.set_status(
+                    f"[{i}/{len(pdf_files)}] {name} - page {p}/{total} | "
+                    f"File ETA: {format_eta(eta_file)} | Folder ETA: {format_eta(eta_folder)}")
 
             try:
                 if mode in ("text", "both"):
