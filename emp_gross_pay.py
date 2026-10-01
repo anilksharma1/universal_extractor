@@ -12,7 +12,8 @@ Both files are written next to the source PDF. The template's existing
 headers, styles, and column layout are left untouched -- data rows start at
 row 3 (below the two header rows), and no other file is copied into it.
 
-The BDE template workbook is auto-detected: any *.xlsx file in the input
+The BDE template workbook is optional; if none is found, built-in headers are used.
+When present it is auto-detected: any *.xlsx file in the input
 folder with "template" in its name (case-insensitive, excluding Excel lock
 files and this script's own "*_template.xlsx" output) is used -- no need to
 pass its path separately. Place it in the same folder as the PDFs.
@@ -60,6 +61,15 @@ TEMPLATE_COL = {
     "Entity Type_Employee": 7,
     "Social Security Number (SSN)": 23,
 }
+
+
+def builtin_header_rows(ncols=None):
+    """Two header rows built from TEMPLATE_COL, used when no template workbook is supplied."""
+    width = max(max(TEMPLATE_COL.values()), ncols or 0)
+    row = [""] * width
+    for name, col in TEMPLATE_COL.items():
+        row[col - 1] = name
+    return [list(row), list(row)]
 
 
 @contextlib.contextmanager
@@ -195,8 +205,15 @@ def format_ssn(raw: str) -> str:
 
 
 def build_template_workbook(template_path, records):
-    wb = openpyxl.load_workbook(template_path)
-    ws = wb[TEMPLATE_SHEET_NAME]
+    if template_path:
+        wb = openpyxl.load_workbook(template_path)
+        ws = wb[TEMPLATE_SHEET_NAME]
+    else:
+        wb = openpyxl.Workbook()
+        ws = wb.active
+        ws.title = TEMPLATE_SHEET_NAME
+        for row_vals in builtin_header_rows():
+            ws.append(row_vals)
 
     row_ptr = 3
     for rec in records:
@@ -213,7 +230,8 @@ def build_template_workbook(template_path, records):
     return wb
 
 
-def find_template(folder: Path) -> Path:
+def find_template(folder: Path):
+    """Return the BDE template in folder, or None to use built-in headers."""
     candidates = [
         p for p in folder.glob("*.xlsx")
         if not p.name.startswith("~$")
@@ -221,10 +239,7 @@ def find_template(folder: Path) -> Path:
         and not p.name.lower().endswith("_template.xlsx")
     ]
     if not candidates:
-        raise FileNotFoundError(
-            f"No BDE template file found in {folder} "
-            f"(expected an .xlsx with 'template' in its name, e.g. 'BDE Template_Community Health.xlsx')"
-        )
+        return None
     if len(candidates) > 1:
         raise FileNotFoundError(
             f"Multiple possible template files found in {folder}: {[c.name for c in candidates]}. "
@@ -250,13 +265,15 @@ def main():
     except FileNotFoundError as e:
         print(e)
         return
-    print(f"Using template: {template_path.name}")
-
-    check_wb = openpyxl.load_workbook(template_path, read_only=True)
-    if TEMPLATE_SHEET_NAME not in check_wb.sheetnames:
-        print(f"Sheet '{TEMPLATE_SHEET_NAME}' not found in template: {template_path}")
-        return
-    check_wb.close()
+    if template_path:
+        print(f"Using template: {template_path.name}")
+        check_wb = openpyxl.load_workbook(template_path, read_only=True)
+        if TEMPLATE_SHEET_NAME not in check_wb.sheetnames:
+            print(f"Sheet '{TEMPLATE_SHEET_NAME}' not found in template: {template_path}")
+            return
+        check_wb.close()
+    else:
+        print("No template workbook found -- using built-in headers.")
 
     with print_via_tqdm():
         for pdf in tqdm(pdf_files, desc="Extracting", unit="file"):

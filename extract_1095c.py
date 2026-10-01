@@ -55,7 +55,7 @@ are flagged in the console output for manual review since the 3-word
 assumption doesn't hold for them.
 
 Usage:
-    python extract_1095c.py <pdf_file_or_folder> <bde_template.xlsx> [-o output_dir]
+    python extract_1095c.py <pdf_file_or_folder> [bde_template.xlsx] [-o output_dir]
 
 Requires:
     pip install pymupdf openpyxl
@@ -86,6 +86,15 @@ TEMPLATE_COL = {
     "Social Security Number (SSN)": 23,
 }
 TEMPLATE_PAGE_COL = 66  # one past the template's own last column (65)
+
+def builtin_header_rows(ncols=None):
+    """Two header rows built from TEMPLATE_COL, used when no template workbook is supplied."""
+    width = max(max(TEMPLATE_COL.values()), ncols or 0)
+    row = [""] * width
+    for name, col in TEMPLATE_COL.items():
+        row[col - 1] = name
+    return [list(row), list(row)]
+
 
 OUTPUT_COLUMNS = [
     "Page", "Format", "First Name", "Middle Name", "Last Name",
@@ -399,8 +408,15 @@ def build_workbook(records):
 def build_template_workbook(template_path, records, doc_id):
     records = dedupe_complete_rows(records)
 
-    wb = openpyxl.load_workbook(template_path)
-    ws = wb[TEMPLATE_SHEET_NAME]
+    if template_path:
+        wb = openpyxl.load_workbook(template_path)
+        ws = wb[TEMPLATE_SHEET_NAME]
+    else:
+        wb = openpyxl.Workbook()
+        ws = wb.active
+        ws.title = TEMPLATE_SHEET_NAME
+        for row_vals in builtin_header_rows(TEMPLATE_PAGE_COL - 1):
+            ws.append(row_vals)
 
     ws.cell(row=1, column=TEMPLATE_PAGE_COL, value="Page #")
     ws.cell(row=2, column=TEMPLATE_PAGE_COL, value="Page #")
@@ -426,7 +442,9 @@ def build_template_workbook(template_path, records, doc_id):
 def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("input", help="PDF file or folder of PDFs")
-    parser.add_argument("template", help="Path to BDE Template_Community Health.xlsx (read only, never modified)")
+    parser.add_argument("template", nargs="?", default=None,
+                        help="Optional path to BDE Template_Community Health.xlsx (read only, never modified); "
+                             "if omitted, built-in headers are used")
     parser.add_argument("-o", "--output-dir", default=".", help="Directory to write outputs into")
     parser.add_argument("--debug", action="store_true",
                          help="Also write <pdf>_debug.txt (line-numbered page text) to the output dir "
@@ -442,11 +460,12 @@ def main():
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    tmpl_wb = openpyxl.load_workbook(args.template, read_only=True)
-    if TEMPLATE_SHEET_NAME not in tmpl_wb.sheetnames:
-        print(f"Sheet '{TEMPLATE_SHEET_NAME}' not found in template: {args.template}")
-        return
-    tmpl_wb.close()
+    if args.template:
+        tmpl_wb = openpyxl.load_workbook(args.template, read_only=True)
+        if TEMPLATE_SHEET_NAME not in tmpl_wb.sheetnames:
+            print(f"Sheet '{TEMPLATE_SHEET_NAME}' not found in template: {args.template}")
+            return
+        tmpl_wb.close()
 
     for pdf in pdf_files:
         print(f"Processing {pdf.name} ...")

@@ -17,7 +17,7 @@ regardless of a page's /Rotate flag (0/90/180/270), so no manual re-rendering
 is needed for digitally generated PDFs.
 
 Usage:
-    python extract_and_build_bde.py <pdf_file_or_folder> <bde_template.xlsx> [-o output_dir]
+    python extract_and_build_bde.py <pdf_file_or_folder> [bde_template.xlsx] [-o output_dir]
 
 Requires:
     pip install pymupdf openpyxl
@@ -56,6 +56,15 @@ TEMPLATE_COL = {
     "Entity Type_Employee": 7,
     "Social Security Number (SSN)": 23,
 }
+
+
+def builtin_header_rows(ncols=None):
+    """Two header rows built from TEMPLATE_COL, used when no template workbook is supplied."""
+    width = max(max(TEMPLATE_COL.values()), ncols or 0)
+    row = [""] * width
+    for name, col in TEMPLATE_COL.items():
+        row[col - 1] = name
+    return [list(row), list(row)]
 
 
 def group_words_into_lines(words, y_tol=3):
@@ -194,7 +203,9 @@ def build_template_workbook(records, template_header_rows, template_col_widths):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("input", help="PDF file or folder of PDFs")
-    parser.add_argument("template", help="Path to BDE Template_Community Health.xlsx")
+    parser.add_argument("template", nargs="?", default=None,
+                        help="Optional path to BDE Template_Community Health.xlsx; "
+                             "if omitted, built-in headers are used")
     parser.add_argument("-o", "--output-dir", default=".", help="Directory to write the workbooks into")
     args = parser.parse_args()
 
@@ -207,13 +218,17 @@ def main():
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    tmpl_wb = openpyxl.load_workbook(args.template)
-    tmpl_ws = tmpl_wb[TEMPLATE_SHEET_NAME]
-    template_header_rows = [[c.value for c in tmpl_ws[1]], [c.value for c in tmpl_ws[2]]]
-    template_col_widths = [
-        tmpl_ws.column_dimensions[get_column_letter(i)].width
-        for i in range(1, tmpl_ws.max_column + 1)
-    ]
+    if args.template:
+        tmpl_wb = openpyxl.load_workbook(args.template)
+        tmpl_ws = tmpl_wb[TEMPLATE_SHEET_NAME]
+        template_header_rows = [[c.value for c in tmpl_ws[1]], [c.value for c in tmpl_ws[2]]]
+        template_col_widths = [
+            tmpl_ws.column_dimensions[get_column_letter(i)].width
+            for i in range(1, tmpl_ws.max_column + 1)
+        ]
+    else:
+        template_header_rows = builtin_header_rows()
+        template_col_widths = []
 
     report_cols = [label for label, _ in HEADER_DEFS]
 
