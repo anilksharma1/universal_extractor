@@ -1,7 +1,7 @@
 # extract_form_fields.py — Extract fillable form field values (AcroForm) and
 # digital signatures from PDFs into a CSV.
 #
-# text_from_pdf.py reads the page's own text layer, so it misses values typed
+# A plain text-layer reader reads the page's own text layer, so it misses values typed
 # into form fields (e.g. an "HCC Academic Advisor" name box): those values are
 # stored in the field itself, not in the page content. This script reads the
 # fields directly with PyMuPDF — including read-only / locked fields that
@@ -28,7 +28,7 @@
 #
 # Requires: pip install PyMuPDF pandas
 #   --ocr also needs: pip install pytesseract Pillow, plus Tesseract installed
-#   (path taken from DEFAULT_TESSERACT_CMD in text_from_pdf.py).
+#   (path taken from DEFAULT_TESSERACT_CMD in this script).
 
 import argparse
 import os
@@ -38,11 +38,34 @@ import sys
 import fitz  # PyMuPDF
 import pandas as pd
 
-from text_from_pdf import resolve_pdf_files, DEFAULT_TESSERACT_CMD
 
 # Damaged PDFs make MuPDF print "MuPDF error: ..." to the console; the file is
 # still repaired and read, so keep the output readable.
 fitz.TOOLS.mupdf_display_errors(False)
+
+DEFAULT_TESSERACT_CMD = r"C:\Tessaract\tesseract.exe"  # set to your tesseract.exe, or None if on PATH
+
+
+def resolve_pdf_files(path: str) -> list:
+    """Return list of absolute PDF paths from a file or folder."""
+    if os.path.isfile(path):
+        if not path.lower().endswith(".pdf"):
+            print(f"Error: '{path}' is not a PDF file.")
+            sys.exit(1)
+        return [os.path.abspath(path)]
+    elif os.path.isdir(path):
+        files = [
+            os.path.abspath(os.path.join(path, f))
+            for f in os.listdir(path)
+            if f.lower().endswith(".pdf")
+        ]
+        if not files:
+            print(f"Error: No PDF files found in '{path}'.")
+            sys.exit(1)
+        return sorted(files)
+    else:
+        print(f"Error: Path does not exist: '{path}'")
+        sys.exit(1)
 if hasattr(fitz.TOOLS, "mupdf_display_warnings"):  # newer PyMuPDF only
     fitz.TOOLS.mupdf_display_warnings(False)
 
