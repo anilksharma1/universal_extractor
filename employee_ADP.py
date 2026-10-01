@@ -32,7 +32,6 @@ USAGE
 from __future__ import annotations
 
 import argparse
-import difflib
 import os
 import re
 import sys
@@ -96,165 +95,6 @@ _CHROME_WORDS = {
     "changed", "field", "from", "to", "employee", "payroll", "changes",
     "page", "of",
 }
-
-# ---------------------------------------------------------------------------
-# Bucket-11 → Template column mapping
-# ---------------------------------------------------------------------------
-# Each entry: bucket11_header → (value_col, cat_col, cat_subitem)
-#   value_col   : template column that receives the actual changed value (None = no direct col)
-#   cat_col     : category column to merge a sub-item into via ";" (None = skip)
-#   cat_subitem : sub-item label appended to cat_col; None = don't touch cat_col
-_BUCKET11_MAP: dict[str, tuple] = {
-    "Additional Earnings Amount":       (None,                            "Work-Related Information",         "Salary or Compensation Information"),
-    "Address - City":                   ("City",                          "Contact Information",              "Home address"),
-    "Address - Country":                ("Country of Residence",          "Contact Information",              "Home address"),
-    "Address - Line 1":                 ("Residential Address",           "Contact Information",              "Home address"),
-    "Address - Line 2":                 ("Residential Address",           "Contact Information",              "Home address"),
-    "Address - Line 2 No":              ("Residential Address",           "Contact Information",              "Home address"),
-    "Address - Line 3":                 ("Residential Address",           "Contact Information",              "Home address"),
-    "Address - State":                  ("State of Residence (if US)",    "Contact Information",              "Home address"),
-    "Address - State No":               ("State of Residence (if US)",    "Contact Information",              "Home address"),
-    "Address - Zip / Postal Code":      ("Zip Code",                      "Contact Information",              "Home address"),
-    "Address - Zip / Postal Code No":   ("Zip Code",                      "Contact Information",              "Home address"),
-    "Basis of Pay":                     (None,                            "Work-Related Information",         "Salary or Compensation Information"),
-    "Basis of Pay No":                  (None,                            "Work-Related Information",         "Salary or Compensation Information"),
-    "Defer Social Security tax":        (None,                            "Government-Issued Identification", "Taxpayer Identification Number (TIN)"),
-    "Dependents No":                    (None,                            "Family Information",               None),
-    "Direct Deposit - Account Number":  (None,                            "Financial Account Information",    "Financial account number"),
-    "Employee Name - First":            ("First Name",                    None,                               None),
-    "Employee Name - First No":         ("First Name",                    None,                               None),
-    "Employee Name - Last":             ("Last Name",                     None,                               None),
-    "Employee Name - Last No":          ("Last Name",                     None,                               None),
-    "Employee Name - Middle":           ("Middle Name",                   None,                               None),
-    "Employee Name - Preferred":        ("PI Notes",                      None,                               None),
-    "Employee Name - Salutation":       ("Suffix",                        None,                               None),
-    "Ethnicity/Race":                   (None,                            "Demographic Information",          "Race/ Ethnicity"),
-    "Ethnicity/Race No":                (None,                            "Demographic Information",          "Race/ Ethnicity"),
-    "Gender for Insurance Coverage No": (None,                            "Health Related Information",       "Health Insurance Information"),
-    "Home Phone":                       ("Phone Number",                  "Contact Information",              "Personal phone number (home)"),
-    "Job Title No":                     (None,                            "Work-Related Information",         "Employment Application Information"),
-    "Lien Dependent Medical Insurance": (None,                            "Health Related Information",       "Health Insurance Information"),
-    "Other Income":                     (None,                            "Work-Related Information",         "Salary or Compensation Information"),
-    "Payee":                            (None,                            "Financial Account Information",    "Financial account number"),
-    "Payroll Name - First":             ("PI Notes",                      None,                               None),
-    "Payroll Name - First No":          ("PI Notes",                      None,                               None),
-    "Payroll Name - Last":              ("PI Notes",                      None,                               None),
-    "Payroll Name - Last No":           ("PI Notes",                      None,                               None),
-    "Personal E-mail":                  ("Email Address - Personal",      "Contact Information",              "Personal email address"),
-    "Personal E-mail No":               ("Email Address - Personal",      "Contact Information",              "Personal email address"),
-    "Personal Mobile":                  ("Phone Number",                  "Contact Information",              "Personal phone number (mobile)"),
-    "Personal Mobile No":               ("Phone Number",                  "Contact Information",              "Personal phone number (mobile)"),
-    "Rate 1":                           (None,                            "Work-Related Information",         "Salary or Compensation Information"),
-    "Rate 1 No":                        (None,                            "Work-Related Information",         "Salary or Compensation Information"),
-    "Rate 2":                           (None,                            "Work-Related Information",         "Salary or Compensation Information"),
-    "Rate 6":                           (None,                            "Work-Related Information",         "Salary or Compensation Information"),
-    "Rate 8":                           (None,                            "Work-Related Information",         "Salary or Compensation Information"),
-    "Social Security Number":           ("Social Security Number",        "Government-Issued Identification", "Social Security Number (SSN)"),
-    "Status":                           (None,                            "Work-Related Information",         "Employment Application Information"),
-    "Tax ID Type":                      (None,                            "Government-Issued Identification", "Taxpayer Identification Number (TIN)"),
-    "Termination Date":                 (None,                            "Work-Related Information",         "Employment Application Information"),
-    "Termination Reason":               (None,                            "Work-Related Information",         "Disciplinary Record or Report"),
-}
-
-# Alias table: normalised alias → exact Bucket-11 header name.
-# Checked before fuzzy matching so abbreviations and common variants always resolve.
-_ALIASES: dict[str, str] = {
-    # Social Security
-    "ssn":                          "Social Security Number",
-    "ss number":                    "Social Security Number",
-    "social security":              "Social Security Number",
-    "soc sec":                      "Social Security Number",
-    "ss no":                        "Social Security Number",
-    # Name fields
-    "first name":                   "Employee Name - First",
-    "last name":                    "Employee Name - Last",
-    "middle name":                  "Employee Name - Middle",
-    "preferred name":               "Employee Name - Preferred",
-    "salutation":                   "Employee Name - Salutation",
-    "payroll first name":           "Payroll Name - First",
-    "payroll last name":            "Payroll Name - Last",
-    # Contact
-    "email":                        "Personal E-mail",
-    "e mail":                       "Personal E-mail",
-    "personal email":               "Personal E-mail",
-    "work email":                   "Personal E-mail",
-    "mobile":                       "Personal Mobile",
-    "cell":                         "Personal Mobile",
-    "cell phone":                   "Personal Mobile",
-    "phone":                        "Home Phone",
-    "home phone":                   "Home Phone",
-    "telephone":                    "Home Phone",
-    # Address
-    "city":                         "Address - City",
-    "state":                        "Address - State",
-    "zip":                          "Address - Zip / Postal Code",
-    "zip code":                     "Address - Zip / Postal Code",
-    "postal code":                  "Address - Zip / Postal Code",
-    "postcode":                     "Address - Zip / Postal Code",
-    "country":                      "Address - Country",
-    "address":                      "Address - Line 1",
-    "address line 1":               "Address - Line 1",
-    "address line 2":               "Address - Line 2",
-    "address line 3":               "Address - Line 3",
-    "street":                       "Address - Line 1",
-    # Pay / rates
-    "pay rate":                     "Rate 1",
-    "hourly rate":                  "Rate 1",
-    "rate":                         "Rate 1",
-    "wage":                         "Rate 1",
-    "wages":                        "Rate 1",
-    "hourly wage":                  "Rate 1",
-    "salary rate":                  "Rate 1",
-    "base pay":                     "Basis of Pay",
-    "salary":                       "Basis of Pay",
-    "annual salary":                "Basis of Pay",
-    "base salary":                  "Basis of Pay",
-    "gross pay":                    "Basis of Pay",
-    "pay basis":                    "Basis of Pay",
-    "earnings":                     "Additional Earnings Amount",
-    "additional pay":               "Additional Earnings Amount",
-    "other pay":                    "Other Income",
-    "income":                       "Other Income",
-    "other income":                 "Other Income",
-    "gross income":                 "Other Income",
-    "annual income":                "Other Income",
-    "net income":                   "Other Income",
-    # Demographics
-    "gender":                       "Gender for Insurance Coverage No",
-    "sex":                          "Gender for Insurance Coverage No",
-    "race":                         "Ethnicity/Race",
-    "ethnicity":                    "Ethnicity/Race",
-    "race ethnicity":               "Ethnicity/Race",
-    # Employment
-    "job title":                    "Job Title No",
-    "title":                        "Job Title No",
-    "status":                       "Status",
-    "employment status":            "Status",
-    "term date":                    "Termination Date",
-    "termination":                  "Termination Date",
-    "separation date":              "Termination Date",
-    "term reason":                  "Termination Reason",
-    "separation reason":            "Termination Reason",
-    "reason for termination":       "Termination Reason",
-    # Financial
-    "direct deposit":               "Direct Deposit - Account Number",
-    "bank account":                 "Direct Deposit - Account Number",
-    "account number":               "Direct Deposit - Account Number",
-    "dd account":                   "Direct Deposit - Account Number",
-    "payee":                        "Payee",
-    # Tax / ID
-    "tax id":                       "Tax ID Type",
-    "tin":                          "Tax ID Type",
-    "taxpayer id":                  "Tax ID Type",
-    "defer ss":                     "Defer Social Security tax",
-    "defer soc sec":                "Defer Social Security tax",
-    # Other
-    "dependents":                   "Dependents No",
-    "dependent count":              "Dependents No",
-    "medical insurance":            "Lien Dependent Medical Insurance",
-    "lien":                         "Lien Dependent Medical Insurance",
-}
-
 
 # ---------------------------------------------------------------------------
 # Text helpers
@@ -785,193 +625,18 @@ def write_processing_report(report_path: Path, rows: list[dict]) -> None:
         raise
 
 
-# ---------------------------------------------------------------------------
-# Template-output helpers (fuzzy match + pivot)
-# ---------------------------------------------------------------------------
-
-def _load_bucket11_headers(path: Path) -> list[str]:
-    """Load the Bucket-11 responsive header list from an Excel file."""
-    wb = openpyxl.load_workbook(str(path))
-    ws = wb.active
-    headers = [
-        str(row[0]).strip()
-        for i, row in enumerate(ws.iter_rows(values_only=True), 1)
-        if i > 1 and row[0]
-    ]
-    wb.close()
-    return headers
-
-
-def _load_template(path: Path) -> tuple[list[str], list]:
-    """Return (headers, tags_row) from rows 1 and 2 of the template.
-
-    Row 1 = column headers.
-    Row 2 = pre-filled dropdown tag values (semicolon-separated where multiple).
-    """
-    wb = openpyxl.load_workbook(str(path))
-    ws = wb.active
-    rows = list(ws.iter_rows(min_row=1, max_row=2, values_only=True))
-    headers = [str(v).strip() if v is not None else "" for v in rows[0]]
-    tags    = list(rows[1]) if len(rows) > 1 else []
-    # Pad tags list to the same width as headers
-    while len(tags) < len(headers):
-        tags.append(None)
-    wb.close()
-    return headers, tags
-
-
-def _norm_col(name: str) -> str:
-    """Normalise a column name for fuzzy lookup (collapse whitespace/dashes)."""
-    return re.sub(r"[\s–—\-]+", " ", name or "").lower().strip()
-
-
-def _build_col_lookup(headers: list[str]) -> dict[str, str]:
-    """Return {normalised_name: actual_name} for template column resolution."""
-    return {_norm_col(h): h for h in headers if h}
-
-
-def _fuzzy_match_header(field: str, candidates: list[str], cutoff: float = 0.65) -> str | None:
-    """Return the closest Bucket-11 header for a Changed Field string, or None.
-
-    Checks the _ALIASES table first (exact normalised match), then falls back
-    to difflib fuzzy matching against the full candidate list.
-    """
-    field_norm = _norm_col(field)
-    # 1. Alias table — handles abbreviations and common variants
-    alias_hit = _ALIASES.get(field_norm)
-    if alias_hit:
-        return alias_hit
-    # 2. Fuzzy match against the Bucket-11 header list
-    cand_norms = [_norm_col(c) for c in candidates]
-    matches = difflib.get_close_matches(field_norm, cand_norms, n=1, cutoff=cutoff)
-    if not matches:
-        return None
-    return candidates[cand_norms.index(matches[0])]
-
-
-_BLANK_VALUES = {"", "no value", "n/a", "none", "null", "-", "–", "—"}
-
-
-def _select_value(changed_from: str, changed_to: str) -> str:
-    """Use Changed To unless it is blank/no-value, then fall back to Changed From."""
-    to_clean = changed_to.strip()
-    return changed_from.strip() if to_clean.lower() in _BLANK_VALUES else to_clean
-
-
-def _pivot_to_template_rows(
-    change_rows: list[dict],
-    docid: str,
-    template_headers: list[str],
-    bucket11_headers: list[str],
-) -> tuple[list[dict], int, int]:
-    """Convert per-change rows to one row per employee in template column layout.
-
-    Changed Field values are fuzzy-matched against the Bucket-11 header list,
-    then mapped to the appropriate template column via _BUCKET11_MAP.
-    Category columns (e.g. Contact Information) accumulate unique sub-items
-    separated by ";".
-
-    Returns (rows, matched_count, unmatched_count).
-    """
-    col_lookup = _build_col_lookup(template_headers)
-
-    def _find_col(name: str | None) -> str | None:
-        if not name:
-            return None
-        return col_lookup.get(_norm_col(name))
-
-    # emp_key → template row dict
-    emp_rows: dict[tuple, dict] = {}
-    # emp_key → {cat_col: [sub_items...]}
-    cat_acc: dict[tuple, dict[str, list[str]]] = {}
-
-    matched   = 0
-    unmatched = 0
-
-    for rec in change_rows:
-        emp_key = (rec.get("Associate ID", ""), rec.get("Last Name", ""), rec.get("First Name", ""))
-
-        if emp_key not in emp_rows:
-            row: dict = {h: "" for h in template_headers}
-            row[_find_col("DOCID")        or "DOCID"]       = rec.get("DOCID", docid)
-            row[_find_col("Last Name")    or "Last Name"]   = rec.get("Last Name", "")
-            row[_find_col("First Name")   or "First Name"]  = rec.get("First Name", "")
-            row[_find_col("Middle Name")  or "Middle Name"] = rec.get("Middle Name", "")
-            row[_find_col("Data Subject Type") or "Data Subject Type"] = "Employee"
-            eic = _find_col("Employee Identification Number")
-            if eic:
-                row[eic] = rec.get("Associate ID", "")
-            emp_rows[emp_key] = row
-            cat_acc[emp_key]  = {}
-
-        row  = emp_rows[emp_key]
-        cats = cat_acc[emp_key]
-
-        field = rec.get("Changed Field", "")
-        value = _select_value(rec.get("Changed From", ""), rec.get("Changed To", ""))
-
-        b11_hdr = _fuzzy_match_header(field, bucket11_headers)
-        if b11_hdr is None:
-            unmatched += 1
-            continue
-        mapping = _BUCKET11_MAP.get(b11_hdr)
-        if mapping is None:
-            unmatched += 1
-            continue
-
-        matched += 1
-        value_col_name, cat_col_name, cat_subitem = mapping
-
-        # ── Write to direct value column ────────────────────────────────────
-        vcol = _find_col(value_col_name)
-        if vcol and value:
-            existing = row.get(vcol, "")
-            if not existing:
-                row[vcol] = value
-            elif value not in existing:
-                row[vcol] = existing + "; " + value
-
-        # ── Accumulate category sub-item ────────────────────────────────────
-        ccol = _find_col(cat_col_name)
-        if ccol and cat_subitem:
-            items = cats.setdefault(ccol, [])
-            if cat_subitem not in items:
-                items.append(cat_subitem)
-
-    # Merge accumulated category sub-items into each row
-    for emp_key, row in emp_rows.items():
-        for ccol, items in cat_acc[emp_key].items():
-            if items:
-                existing = row.get(ccol, "")
-                for item in items:
-                    if item not in existing:
-                        existing = (existing + ";" + item) if existing else item
-                row[ccol] = existing
-
-    return list(emp_rows.values()), matched, unmatched
-
-
 def write_per_pdf_output(
     out_path: Path,
     change_rows: list[dict],
     warning: str,
-    template_headers: list[str] | None = None,
-    template_tags: list | None = None,
-    bucket11_headers: list[str] | None = None,
-) -> dict:
-    """Write one workbook per PDF with two sheets.
+) -> None:
+    """Write one workbook per PDF.
 
     Sheet 1 — "Native extracted": every raw change row from this PDF.
-    Sheet 2 — "Import Template":  one row per employee mapped to the template
-               format.  Row 1 = headers, Row 2 = pre-filled dropdown tags
-               (copied from Latest Template.xlsx row 2), Row 3+ = data.
-               Only written when template_headers and bucket11_headers are supplied.
-
-    Returns a stats dict: {template_employees, matched_fields, unmatched_fields}.
+    Sheet 2 — "Warnings" (only when there is a warning).
     """
     tmp_path = out_path.with_suffix(".tmp.xlsx")
     wb = openpyxl.Workbook()
-    stats = {"template_employees": 0, "matched_fields": 0, "unmatched_fields": 0}
     try:
         # ── Sheet 1: Native extracted ─────────────────────────────────────────
         ws1 = wb.active
@@ -986,21 +651,6 @@ def write_per_pdf_output(
             else:
                 _last_name = row[_name_idx]
             ws1.append(row)
-
-        # ── Sheet 2: Import Template ──────────────────────────────────────────
-        if template_headers and bucket11_headers:
-            tmpl_rows, matched, unmatched = _pivot_to_template_rows(
-                change_rows, "", template_headers, bucket11_headers
-            )
-            stats["template_employees"] = len(tmpl_rows)
-            stats["matched_fields"]     = matched
-            stats["unmatched_fields"]   = unmatched
-            ws2 = wb.create_sheet("Import Template")
-            ws2.append(template_headers)
-            if template_tags:
-                ws2.append(template_tags)
-            for row_dict in tmpl_rows:
-                ws2.append([_csv_safe(row_dict.get(h, "")) for h in template_headers])
 
         # ── Warnings sheet ────────────────────────────────────────────────────
         if warning:
@@ -1020,7 +670,6 @@ def write_per_pdf_output(
         except OSError:
             pass
         raise
-    return stats
 
 
 # ---------------------------------------------------------------------------
@@ -1167,12 +816,6 @@ def main() -> int:
                         help="Pages to show in --diagnose mode (default 3)")
     parser.add_argument("--selftest", action="store_true",
                         help="Run built-in parser tests and exit")
-    parser.add_argument("--template-file", metavar="XLSX",
-                        help="Latest Template xlsx; when provided, also write "
-                             "{stem}_Template_Output.xlsx per PDF")
-    parser.add_argument("--bucket-list", metavar="XLSX",
-                        help="Bucket-11 header list xlsx "
-                             "(default: Bucket_11_List.xlsx beside this script)")
     args = parser.parse_args()
 
     if args.selftest:
@@ -1198,32 +841,6 @@ def main() -> int:
             _diagnose(pdf_path, max_pages=args.diagnose_pages)
         return 0
 
-    # ── Load template + bucket-list (auto-detect from script folder if not given) ──
-    _script_dir = Path(__file__).parent
-    tmpl_path = (
-        Path(args.template_file) if args.template_file
-        else _script_dir / "Latest Template.xlsx"
-    )
-    bl_path = (
-        Path(args.bucket_list) if args.bucket_list
-        else _script_dir / "Bucket_11_List.xlsx"
-    )
-
-    template_headers: list | None = None
-    template_tags:    list | None = None
-    bucket11_headers: list | None = None
-
-    if tmpl_path.exists() and bl_path.exists():
-        template_headers, template_tags = _load_template(tmpl_path)
-        bucket11_headers = _load_bucket11_headers(bl_path)
-        print(f"Template mode: {len(template_headers)} template cols, "
-              f"{len(bucket11_headers)} Bucket-11 headers loaded.")
-    else:
-        if not tmpl_path.exists():
-            print(f"WARNING: template file not found — {tmpl_path} (Import Template sheet skipped)")
-        if not bl_path.exists():
-            print(f"WARNING: bucket-list not found — {bl_path} (Import Template sheet skipped)")
-
     pbar = (
         _tqdm(total=len(pdfs), unit="file", desc="Processing",
               ncols=80, colour="cyan")
@@ -1247,26 +864,8 @@ def main() -> int:
 
             if not args.debug:
                 out_path = output_folder / f"{pdf_path.stem}_extracted.xlsx"
-                stats = write_per_pdf_output(
-                    out_path,
-                    rows,
-                    rpt["warning"],
-                    template_headers=template_headers,
-                    template_tags=template_tags,
-                    bucket11_headers=bucket11_headers,
-                )
-                sheets = "Native extracted"
-                if template_headers and bucket11_headers:
-                    emp_n   = stats["template_employees"]
-                    matched = stats["matched_fields"]
-                    unmatched = stats["unmatched_fields"]
-                    sheets += f" + Import Template ({emp_n} employee(s), {matched} field(s) mapped"
-                    if unmatched:
-                        sheets += f", {unmatched} unmatched"
-                    sheets += ")"
-                elif not template_headers:
-                    sheets += "  [Import Template skipped — template file not loaded]"
-                _log(f"  Wrote: {out_path.name}  [{sheets}]  ({len(rows)} change row(s))")
+                write_per_pdf_output(out_path, rows, rpt["warning"])
+                _log(f"  Wrote: {out_path.name}  ({len(rows)} change row(s))")
 
             if rpt["warning"]:
                 all_warnings.append(f"{pdf_path.name}: {rpt['warning']}")

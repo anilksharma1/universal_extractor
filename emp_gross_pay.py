@@ -3,20 +3,8 @@ Extract EE ID, Employee Name, and SSN from "Employee Gross To Net" PDF
 report(s), writing per source PDF:
 
     <pdf_stem>_extracted.csv    - EE ID, Employee Name, SSN
-    <pdf_stem>_template.xlsx    - rows appended to a copy of the supplied
-                                  BDE Import Template workbook (Doc ID,
-                                  First/Middle/Last Name, Entity
-                                  Type_Employee = TRUE, SSN)
 
-Both files are written next to the source PDF. The template's existing
-headers, styles, and column layout are left untouched -- data rows start at
-row 3 (below the two header rows), and no other file is copied into it.
-
-The BDE template workbook is optional; if none is found, built-in headers are used.
-When present it is auto-detected: any *.xlsx file in the input
-folder with "template" in its name (case-insensitive, excluding Excel lock
-files and this script's own "*_template.xlsx" output) is used -- no need to
-pass its path separately. Place it in the same folder as the PDFs.
+The CSV is written next to the source PDF.
 
 Standalone script (no dependency on employee_gross_to_pay.py) so it can be
 copied next to the PDFs and run from any folder. Uses the same rotation-aware
@@ -26,7 +14,7 @@ Usage:
     python emp_gross_pay.py <pdf_file_or_folder>
 
 Requires:
-    pip install pymupdf openpyxl tqdm
+    pip install pymupdf tqdm
 """
 
 import argparse
@@ -37,7 +25,6 @@ import re
 from pathlib import Path
 
 import pymupdf as fitz
-import openpyxl
 from tqdm import tqdm
 
 SSN_PATTERN = re.compile(r"\d{3}-\d{2}-\d{4}|[*Xx]{3}-[*Xx]{2}-\d{4}")
@@ -51,25 +38,6 @@ HEADER_DEFS = [
 ]
 
 OUTPUT_COLUMNS = ["EE ID", "Employee Name", "SSN"]
-
-TEMPLATE_SHEET_NAME = "Import Template"
-TEMPLATE_COL = {
-    "Doc ID": 1,
-    "First Name": 2,
-    "Middle Name": 3,
-    "Last Name": 4,
-    "Entity Type_Employee": 7,
-    "Social Security Number (SSN)": 23,
-}
-
-
-def builtin_header_rows(ncols=None):
-    """Two header rows built from TEMPLATE_COL, used when no template workbook is supplied."""
-    width = max(max(TEMPLATE_COL.values()), ncols or 0)
-    row = [""] * width
-    for name, col in TEMPLATE_COL.items():
-        row[col - 1] = name
-    return [list(row), list(row)]
 
 
 @contextlib.contextmanager
@@ -177,20 +145,6 @@ def write_csv(records, out_path):
             writer.writerow(row)
 
 
-def split_last_first_middle(name: str):
-    name = (name or "").strip()
-    if not name:
-        return "", "", ""
-    if "," in name:
-        last, rest = name.split(",", 1)
-        parts = rest.strip().split()
-        first = parts[0] if parts else ""
-        middle = " ".join(parts[1:]) if len(parts) > 1 else ""
-        return last.strip(), first, middle
-    print(f"  [warn] name '{name}' has no comma ('Last, First' expected) -- placed entirely in Last Name")
-    return name, "", ""
-
-
 def format_ssn(raw: str) -> str:
     """Return only the SSN itself, formatted as ###-##-####, discarding any
     other characters/text captured alongside it in the same column."""
@@ -204,50 +158,6 @@ def format_ssn(raw: str) -> str:
     return digits
 
 
-def build_template_workbook(template_path, records):
-    if template_path:
-        wb = openpyxl.load_workbook(template_path)
-        ws = wb[TEMPLATE_SHEET_NAME]
-    else:
-        wb = openpyxl.Workbook()
-        ws = wb.active
-        ws.title = TEMPLATE_SHEET_NAME
-        for row_vals in builtin_header_rows():
-            ws.append(row_vals)
-
-    row_ptr = 3
-    for rec in records:
-        last, first, middle = split_last_first_middle(rec.get("Employee Name", ""))
-        ws.cell(row=row_ptr, column=TEMPLATE_COL["Doc ID"], value=rec.get("Doc ID", ""))
-        ws.cell(row=row_ptr, column=TEMPLATE_COL["First Name"], value=first)
-        ws.cell(row=row_ptr, column=TEMPLATE_COL["Middle Name"], value=middle)
-        ws.cell(row=row_ptr, column=TEMPLATE_COL["Last Name"], value=last)
-        ws.cell(row=row_ptr, column=TEMPLATE_COL["Entity Type_Employee"], value=True)
-        ssn_cell = ws.cell(row=row_ptr, column=TEMPLATE_COL["Social Security Number (SSN)"],
-                            value=format_ssn(rec.get("SSN", "")))
-        ssn_cell.number_format = "@"  # keep as text so Excel doesn't strip dashes/leading zeros
-        row_ptr += 1
-    return wb
-
-
-def find_template(folder: Path):
-    """Return the BDE template in folder, or None to use built-in headers."""
-    candidates = [
-        p for p in folder.glob("*.xlsx")
-        if not p.name.startswith("~$")
-        and "template" in p.name.lower()
-        and not p.name.lower().endswith("_template.xlsx")
-    ]
-    if not candidates:
-        return None
-    if len(candidates) > 1:
-        raise FileNotFoundError(
-            f"Multiple possible template files found in {folder}: {[c.name for c in candidates]}. "
-            f"Keep only one."
-        )
-    return candidates[0]
-
-
 def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("input", help="PDF file or folder of PDFs")
@@ -258,22 +168,6 @@ def main():
     if not pdf_files:
         print(f"No PDF files found at: {input_path}")
         return
-
-    search_dir = input_path.parent if input_path.is_file() else input_path
-    try:
-        template_path = find_template(search_dir)
-    except FileNotFoundError as e:
-        print(e)
-        return
-    if template_path:
-        print(f"Using template: {template_path.name}")
-        check_wb = openpyxl.load_workbook(template_path, read_only=True)
-        if TEMPLATE_SHEET_NAME not in check_wb.sheetnames:
-            print(f"Sheet '{TEMPLATE_SHEET_NAME}' not found in template: {template_path}")
-            return
-        check_wb.close()
-    else:
-        print("No template workbook found -- using built-in headers.")
 
     with print_via_tqdm():
         for pdf in tqdm(pdf_files, desc="Extracting", unit="file"):
@@ -287,10 +181,7 @@ def main():
             csv_path = pdf.parent / f"{pdf.stem}_extracted.csv"
             write_csv(records, csv_path)
 
-            template_out_path = pdf.parent / f"{pdf.stem}_template.xlsx"
-            build_template_workbook(template_path, records).save(template_out_path)
-
-            tqdm.write(f"  {pdf.name} -> {csv_path.name}, {template_out_path.name}")
+            tqdm.write(f"  {pdf.name} -> {csv_path.name}")
 
 
 if __name__ == "__main__":

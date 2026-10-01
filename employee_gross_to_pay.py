@@ -1,23 +1,18 @@
 """
-Extract "Employee Gross To Net" report data from PDF(s) and build, per source file,
-two separate output workbooks:
+Extract "Employee Gross To Net" report data from PDF(s) and write, per source file,
+one output workbook:
 
     <filename>_extracted.xlsx  - every column found in the PDF (EE ID, Employee
                                   Name, SSN, Payment Date, Total Hrs/Units,
                                   Total Earnings, Total Deductions, Total Taxes,
                                   Net Pay)
-    <filename>_template.xlsx   - the same rows mapped into the BDE Import
-                                  Template layout (Doc ID, First/Middle/Last
-                                  Name, Entity Type_Employee = TRUE, SSN),
-                                  header rows copied from the template so
-                                  column positions match
 
 Rotation-aware: PyMuPDF returns word positions in correct reading order
 regardless of a page's /Rotate flag (0/90/180/270), so no manual re-rendering
 is needed for digitally generated PDFs.
 
 Usage:
-    python extract_and_build_bde.py <pdf_file_or_folder> [bde_template.xlsx] [-o output_dir]
+    python employee_gross_to_pay.py <pdf_file_or_folder> [-o output_dir]
 
 Requires:
     pip install pymupdf openpyxl
@@ -46,26 +41,6 @@ HEADER_DEFS = [
     ("Total Taxes", ["Total", "Taxes"]),
     ("Net Pay", ["Net", "Pay"]),
 ]
-
-TEMPLATE_SHEET_NAME = "Import Template"
-TEMPLATE_COL = {
-    "Doc ID": 1,
-    "First Name": 2,
-    "Middle Name": 3,
-    "Last Name": 4,
-    "Entity Type_Employee": 7,
-    "Social Security Number (SSN)": 23,
-}
-
-
-def builtin_header_rows(ncols=None):
-    """Two header rows built from TEMPLATE_COL, used when no template workbook is supplied."""
-    width = max(max(TEMPLATE_COL.values()), ncols or 0)
-    row = [""] * width
-    for name, col in TEMPLATE_COL.items():
-        row[col - 1] = name
-    return [list(row), list(row)]
-
 
 def group_words_into_lines(words, y_tol=3):
     lines = {}
@@ -150,20 +125,6 @@ def process_pdf(path: Path):
     return all_records
 
 
-def split_last_first_middle(name: str):
-    name = (name or "").strip()
-    if not name:
-        return "", "", ""
-    if "," in name:
-        last, rest = name.split(",", 1)
-        parts = rest.strip().split()
-        first = parts[0] if parts else ""
-        middle = " ".join(parts[1:]) if len(parts) > 1 else ""
-        return last.strip(), first, middle
-    print(f"  [warn] name '{name}' has no comma ('Last, First' expected) -- placed entirely in Last Name")
-    return name, "", ""
-
-
 def build_extracted_workbook(records, report_cols):
     wb = openpyxl.Workbook()
     ws = wb.active
@@ -177,35 +138,9 @@ def build_extracted_workbook(records, report_cols):
     return wb
 
 
-def build_template_workbook(records, template_header_rows, template_col_widths):
-    wb = openpyxl.Workbook()
-    ws = wb.active
-    ws.title = TEMPLATE_SHEET_NAME
-    for row_vals in template_header_rows:
-        ws.append(row_vals)
-    for i, width in enumerate(template_col_widths, start=1):
-        if width:
-            ws.column_dimensions[get_column_letter(i)].width = width
-
-    row_ptr = len(template_header_rows) + 1
-    for rec in records:
-        last, first, middle = split_last_first_middle(rec.get("Employee Name", ""))
-        ws.cell(row=row_ptr, column=TEMPLATE_COL["Doc ID"], value=rec.get("Doc ID", ""))
-        ws.cell(row=row_ptr, column=TEMPLATE_COL["First Name"], value=first)
-        ws.cell(row=row_ptr, column=TEMPLATE_COL["Middle Name"], value=middle)
-        ws.cell(row=row_ptr, column=TEMPLATE_COL["Last Name"], value=last)
-        ws.cell(row=row_ptr, column=TEMPLATE_COL["Entity Type_Employee"], value=True)
-        ws.cell(row=row_ptr, column=TEMPLATE_COL["Social Security Number (SSN)"], value=rec.get("SSN", ""))
-        row_ptr += 1
-    return wb
-
-
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("input", help="PDF file or folder of PDFs")
-    parser.add_argument("template", nargs="?", default=None,
-                        help="Optional path to BDE Template_Community Health.xlsx; "
-                             "if omitted, built-in headers are used")
     parser.add_argument("-o", "--output-dir", default=".", help="Directory to write the workbooks into")
     args = parser.parse_args()
 
@@ -217,18 +152,6 @@ def main():
 
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
-
-    if args.template:
-        tmpl_wb = openpyxl.load_workbook(args.template)
-        tmpl_ws = tmpl_wb[TEMPLATE_SHEET_NAME]
-        template_header_rows = [[c.value for c in tmpl_ws[1]], [c.value for c in tmpl_ws[2]]]
-        template_col_widths = [
-            tmpl_ws.column_dimensions[get_column_letter(i)].width
-            for i in range(1, tmpl_ws.max_column + 1)
-        ]
-    else:
-        template_header_rows = builtin_header_rows()
-        template_col_widths = []
 
     report_cols = [label for label, _ in HEADER_DEFS]
 
@@ -242,13 +165,10 @@ def main():
             continue
 
         extracted_path = output_dir / f"{pdf.stem}_extracted.xlsx"
-        template_path = output_dir / f"{pdf.stem}_template.xlsx"
 
         build_extracted_workbook(records, report_cols).save(extracted_path)
-        build_template_workbook(records, template_header_rows, template_col_widths).save(template_path)
 
         print(f"  -> {extracted_path}")
-        print(f"  -> {template_path}")
 
 
 if __name__ == "__main__":

@@ -1,8 +1,8 @@
 r"""
 extract_401k.py — Extract employee data from 401k contribution PDFs
-and write into the standard 38-column PII template format.
+and write into the standard 38-column PII format.
 
-Column mapping (matches "Latest Template.xlsx"):
+Column mapping:
   A  DOCID                          ← PDF filename stem
   B  Last Name                      ← parsed from name
   C  First Name                     ← parsed from name
@@ -21,15 +21,14 @@ Strategy (in order):
   2. Table extraction           — structured tables via pdfplumber
   3. Regex text scan            — fallback for unstructured / image-heavy PDFs
 
-Output — one {docId}_extracted.xlsx per PDF, rows 1–2 from template,
-         employee data from row 3 onward.
+Output — one {docId}_extracted.xlsx per PDF, header in row 1,
+         employee data from row 2 onward.
 
 USAGE
     python extract_401k.py "C:\path\to\folder"
     python extract_401k.py "C:\path\to\file.pdf"
     python extract_401k.py "C:\path\to\folder" --recursive
     python extract_401k.py "C:\path\to\file.pdf" --output "C:\output"
-    python extract_401k.py "C:\path\to\file.pdf" --template "C:\path\to\Latest Template.xlsx"
 
 DEPENDENCIES
     pip install pdfplumber openpyxl pypdf
@@ -71,7 +70,7 @@ except ImportError:
 
 
 # ---------------------------------------------------------------------------
-# Template column positions (1-based)
+# Column positions (1-based)
 # ---------------------------------------------------------------------------
 
 COL_DOCID          = 1
@@ -1027,7 +1026,7 @@ def extract_401k(pdf_path: Path, doc_id: str) -> list[EmployeeRecord]:
 
 
 # ---------------------------------------------------------------------------
-# Excel writer — uses template for header rows 1 & 2
+# Excel writer
 # ---------------------------------------------------------------------------
 
 def _csv_safe(val) -> str:
@@ -1035,22 +1034,7 @@ def _csv_safe(val) -> str:
     return ("'" + s) if s[:1] in ("=", "+", "-", "@") else s
 
 
-def _load_template_rows(template_path: Path) -> tuple[list, list]:
-    """Return (header_row, reference_row) from the template file."""
-    try:
-        wb  = openpyxl.load_workbook(str(template_path))
-        ws  = wb.active
-        header_row = [_clean(str(ws.cell(row=1, column=c).value or ""))
-                      for c in range(1, TEMPLATE_COL_COUNT + 1)]
-        ref_row    = [_clean(str(ws.cell(row=2, column=c).value or ""))
-                      for c in range(1, TEMPLATE_COL_COUNT + 1)]
-        wb.close()
-        return header_row, ref_row
-    except Exception:
-        return ([], [])
-
-
-_FALLBACK_HEADER = [
+_HEADER = [
     "DOCID", "Last Name", "First Name", "Middle Name", "Suffix",
     "Data Subject Type", "Residential Address", "State of Residence (if US)",
     "Country of Residence", "City", "Province of Residence (if Canada)",
@@ -1081,17 +1065,11 @@ def _write_sheet(ws, header: list, records: list) -> None:
 def write_workbook(
     out_path: Path,
     records: list[EmployeeRecord],
-    template_path: Path | None = None,
 ) -> None:
     tmp = out_path.with_suffix(".tmp.xlsx")
     wb  = openpyxl.Workbook()
 
-    if template_path and template_path.exists():
-        header_row, _ = _load_template_rows(template_path)
-    else:
-        header_row = []
-
-    hdr = header_row if header_row else _FALLBACK_HEADER
+    hdr = _HEADER
 
     # ── "Employees" sheet — all extracted records ─────────────────────────────
     ws = wb.active
@@ -1178,7 +1156,7 @@ def _iter_pdf(target: Path, recursive: bool):
 
 def main() -> int:
     parser = argparse.ArgumentParser(
-        description="Extract employee data from 401k PDFs into the PII template format."
+        description="Extract employee data from 401k PDFs into the PII format."
     )
     parser.add_argument("target", nargs="?",
                         help="PDF file or folder (prompted if omitted)")
@@ -1186,8 +1164,6 @@ def main() -> int:
                         help="Recurse into subfolders")
     parser.add_argument("--output", default=None,
                         help="Output folder for extracted files (default: same folder as PDFs)")
-    parser.add_argument("--template", default=None,
-                        help="Path to Latest Template.xlsx (auto-detected if omitted)")
     args = parser.parse_args()
 
     target_str = args.target
@@ -1207,26 +1183,6 @@ def main() -> int:
     target = Path(target_str)
     if not target.exists():
         sys.exit(f"ERROR: path not found — {target}")
-
-    # Locate template
-    if args.template:
-        template_path = Path(args.template)
-    else:
-        # Auto-detect: script directory or target directory
-        script_dir  = Path(__file__).parent
-        target_dir  = target if target.is_dir() else target.parent
-        candidates  = [
-            script_dir / "Latest Template.xlsx",
-            target_dir / "Latest Template.xlsx",
-        ]
-        template_path = next((p for p in candidates if p.exists()), None)
-
-    if template_path and template_path.exists():
-        print(f"Template: {template_path.name}")
-    else:
-        print("WARNING: 'Latest Template.xlsx' not found — using built-in headers.\n"
-              "         Use --template to specify its path.")
-        template_path = None
 
     files = list(_iter_pdf(target, args.recursive))
     if not files:
@@ -1268,7 +1224,7 @@ def main() -> int:
         try:
             records   = extract_401k(pdf_path, doc_id)
             out_path  = output_dir / f"{doc_id}_extracted.xlsx"
-            write_workbook(out_path, records, template_path)
+            write_workbook(out_path, records)
             total_records += len(records)
             msg = f"{len(records)} record(s)"
         except Exception as exc:

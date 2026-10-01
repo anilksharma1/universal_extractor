@@ -32,21 +32,9 @@ field *names* that failed to match -- never a field's actual value -- so it
 is safe to run and read its output without exposing PHI in a terminal/log
 that might get shared.
 
-Two workbooks are produced per input PDF:
+One workbook is produced per input PDF:
     <filename>_1095c_extracted.xlsx - every field listed above, one row per
                                         employee page
-    <filename>_1095c_template.xlsx  - the same rows mapped into the BDE
-                                        Import Template layout (Doc ID, First/
-                                        Middle/Last Name, Entity Type_Employee
-                                        = TRUE, Street Address, City/State/Zip
-                                        Code, Country, SSN, plus a trailing
-                                        "Page #" column appended after the
-                                        template's own last column (65) for
-                                        traceability -- not part of the BDE
-                                        import spec), written starting at row
-                                        3 (rows 1-2 are the template's header).
-                                        The template argument itself is only
-                                        read, never modified.
 
 Employee name is assumed to be exactly "First Middle Last" (3 space-
 separated words); 2-word or 4+-word names still split (2 -> First/Last with
@@ -55,7 +43,7 @@ are flagged in the console output for manual review since the 3-word
 assumption doesn't hold for them.
 
 Usage:
-    python extract_1095c.py <pdf_file_or_folder> [bde_template.xlsx] [-o output_dir]
+    python extract_1095c.py <pdf_file_or_folder> [-o output_dir]
 
 Requires:
     pip install pymupdf openpyxl
@@ -70,31 +58,6 @@ import openpyxl
 from openpyxl.utils import get_column_letter
 
 MIN_TEXT_CHARS_PER_PAGE = 20  # below this, a page is treated as scanned/image-only
-
-TEMPLATE_SHEET_NAME = "Import Template"
-TEMPLATE_COL = {
-    "Doc ID": 1,
-    "First Name": 2,
-    "Middle Name": 3,
-    "Last Name": 4,
-    "Entity Type_Employee": 7,
-    "Street Address": 11,
-    "City": 12,
-    "State": 13,
-    "Zip Code": 14,
-    "Country": 19,
-    "Social Security Number (SSN)": 23,
-}
-TEMPLATE_PAGE_COL = 66  # one past the template's own last column (65)
-
-def builtin_header_rows(ncols=None):
-    """Two header rows built from TEMPLATE_COL, used when no template workbook is supplied."""
-    width = max(max(TEMPLATE_COL.values()), ncols or 0)
-    row = [""] * width
-    for name, col in TEMPLATE_COL.items():
-        row[col - 1] = name
-    return [list(row), list(row)]
-
 
 OUTPUT_COLUMNS = [
     "Page", "Format", "First Name", "Middle Name", "Last Name",
@@ -375,24 +338,6 @@ def process_pdf(path: Path, debug=False, output_dir=None):
     return records
 
 
-def dedupe_complete_rows(records):
-    """Drop records identical to an already-kept one across every written
-    field (Page excluded, since that's expected to differ even for a true
-    duplicate -- e.g. the same employee's 1095-C appearing twice in a batch
-    export)."""
-    compare_cols = [c for c in OUTPUT_COLUMNS if c != "Page"]
-    seen = set()
-    kept = []
-    for rec in records:
-        key = tuple((str(rec.get(c, "") or "")).strip().lower() for c in compare_cols)
-        if key in seen:
-            print(f"  page {rec.get('Page')}: identical to an earlier record on every field -- dropping as a duplicate")
-            continue
-        seen.add(key)
-        kept.append(rec)
-    return kept
-
-
 def build_workbook(records):
     wb = openpyxl.Workbook()
     ws = wb.active
@@ -405,46 +350,9 @@ def build_workbook(records):
     return wb
 
 
-def build_template_workbook(template_path, records, doc_id):
-    records = dedupe_complete_rows(records)
-
-    if template_path:
-        wb = openpyxl.load_workbook(template_path)
-        ws = wb[TEMPLATE_SHEET_NAME]
-    else:
-        wb = openpyxl.Workbook()
-        ws = wb.active
-        ws.title = TEMPLATE_SHEET_NAME
-        for row_vals in builtin_header_rows(TEMPLATE_PAGE_COL - 1):
-            ws.append(row_vals)
-
-    ws.cell(row=1, column=TEMPLATE_PAGE_COL, value="Page #")
-    ws.cell(row=2, column=TEMPLATE_PAGE_COL, value="Page #")
-
-    row_ptr = 3  # rows 1-2 are the template's header; data starts at row 3
-    for rec in records:
-        ws.cell(row=row_ptr, column=TEMPLATE_COL["Doc ID"], value=doc_id)
-        ws.cell(row=row_ptr, column=TEMPLATE_COL["First Name"], value=rec.get("First Name", ""))
-        ws.cell(row=row_ptr, column=TEMPLATE_COL["Middle Name"], value=rec.get("Middle Name", ""))
-        ws.cell(row=row_ptr, column=TEMPLATE_COL["Last Name"], value=rec.get("Last Name", ""))
-        ws.cell(row=row_ptr, column=TEMPLATE_COL["Entity Type_Employee"], value=True)
-        ws.cell(row=row_ptr, column=TEMPLATE_COL["Street Address"], value=rec.get("Street Address", ""))
-        ws.cell(row=row_ptr, column=TEMPLATE_COL["City"], value=rec.get("City", ""))
-        ws.cell(row=row_ptr, column=TEMPLATE_COL["State"], value=rec.get("State", ""))
-        ws.cell(row=row_ptr, column=TEMPLATE_COL["Zip Code"], value=rec.get("Zip Code", ""))
-        ws.cell(row=row_ptr, column=TEMPLATE_COL["Country"], value=rec.get("Country", ""))
-        ws.cell(row=row_ptr, column=TEMPLATE_COL["Social Security Number (SSN)"], value=rec.get("SSN", ""))
-        ws.cell(row=row_ptr, column=TEMPLATE_PAGE_COL, value=rec.get("Page", ""))
-        row_ptr += 1
-    return wb
-
-
 def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("input", help="PDF file or folder of PDFs")
-    parser.add_argument("template", nargs="?", default=None,
-                        help="Optional path to BDE Template_Community Health.xlsx (read only, never modified); "
-                             "if omitted, built-in headers are used")
     parser.add_argument("-o", "--output-dir", default=".", help="Directory to write outputs into")
     parser.add_argument("--debug", action="store_true",
                          help="Also write <pdf>_debug.txt (line-numbered page text) to the output dir "
@@ -460,13 +368,6 @@ def main():
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    if args.template:
-        tmpl_wb = openpyxl.load_workbook(args.template, read_only=True)
-        if TEMPLATE_SHEET_NAME not in tmpl_wb.sheetnames:
-            print(f"Sheet '{TEMPLATE_SHEET_NAME}' not found in template: {args.template}")
-            return
-        tmpl_wb.close()
-
     for pdf in pdf_files:
         print(f"Processing {pdf.name} ...")
         records = process_pdf(pdf, debug=args.debug, output_dir=output_dir)
@@ -475,13 +376,10 @@ def main():
             continue
 
         extracted_path = output_dir / f"{pdf.stem}_1095c_extracted.xlsx"
-        template_path = output_dir / f"{pdf.stem}_1095c_template.xlsx"
 
         build_workbook(records).save(extracted_path)
-        build_template_workbook(args.template, records, pdf.name).save(template_path)
 
         print(f"  -> {extracted_path.name} ({len(records)} record(s))")
-        print(f"  -> {template_path.name}")
 
 
 if __name__ == "__main__":
