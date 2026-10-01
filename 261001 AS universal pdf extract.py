@@ -107,13 +107,6 @@ def _clean(text) -> str:
     return " ".join(str(text or "").split()).strip()
 
 
-def _csv_safe(value) -> str:
-    """Prefix a leading =+-@ with an apostrophe so Excel/CSV never treats an
-    extracted field as a formula."""
-    s = str(value or "")
-    if s[:1] in ("=", "+", "-", "@"):
-        return "'" + s
-    return s
 
 
 def _iter_pdfs(target: Path, recursive: bool = False):
@@ -154,8 +147,6 @@ def normalize_text(s: str) -> str:
 
 W2_MIN_TEXT_CHARS_PER_PAGE = 20
 
-W2_CSV_COLUMNS = ["Page", "First Name", "Last Name", "Suffix",
-                  "Street Address", "City", "State", "Zip Code", "SSN"]
 
 W2_NAME_SUFFIXES = {"JR", "SR", "II", "III", "IV", "V"}
 
@@ -163,10 +154,6 @@ W2_SSN_CAPTION_RE = re.compile(r"Employee.?s\s+(?:social security number|SSN)\b"
 W2_NAME_ONLY_CAPTION_RE = re.compile(r"Employee.?s\s+first name and initial\b", re.IGNORECASE)
 W2_COMBINED_NAME_ADDR_CAPTION_RE = re.compile(r"Employee.?s\s+name,\s*address", re.IGNORECASE)
 W2_ADDRESS_CAPTION_RE = re.compile(r"\bf\s+Employee.?s address\b", re.IGNORECASE)
-W2_NAME_CAPTION_RE = re.compile(
-    r"Employee.?s\s+(?:first name and initial|name,\s*address)|\bf\s+Employee.?s address\b",
-    re.IGNORECASE,
-)
 W2_STOP_LABEL_RE = re.compile(
     r"^(?:\d{1,2}\s+State\b|Employer.s state ID|Local income tax|Locality name|"
     r"Form\s*W-?2\b|Wage\s*(?:&|and)\s*Tax Statement|Copy\s+[A-Z0-9]|"
@@ -195,10 +182,10 @@ def w2_normalize_ssn(match):
     return f"{match.group(1)}-{match.group(2)}-{match.group(3)}"
 
 
-def w2_group_words_into_lines(words, y_tol=3):
+def group_words_into_lines(words, y_tol=3):
     lines = {}
     for w in words:
-        x0, y0, x1, y1, text = w[0], w[1], w[2], w[3], w[4]
+        x0, y0, x1, text = w[0], w[1], w[2], w[4]
         key = round(y0 / y_tol) * y_tol
         lines.setdefault(key, []).append((x0, x1, text))
     return [sorted(v, key=lambda t: t[0]) for _, v in sorted(lines.items())]
@@ -602,7 +589,7 @@ def w2_extract_wages_from_lines(lines) -> dict:
 
 
 def w2_extract_wages_for_cell(column_words) -> dict:
-    return w2_extract_wages_from_lines(w2_group_words_into_lines(column_words))
+    return w2_extract_wages_from_lines(group_words_into_lines(column_words))
 
 
 def w2_process_page(page, page_num, split_fraction, want_wages):
@@ -643,7 +630,7 @@ def w2_process_page(page, page_num, split_fraction, want_wages):
             cells = w2_build_grid_cells(page, words, groups, split_fraction, page_num)
 
     for column_label, column_words in cells:
-        lines = w2_group_words_into_lines(column_words)
+        lines = group_words_into_lines(column_words)
         plain_lines = [normalize_text(" ".join(t for _, _, t in ln)) for ln in lines]
 
         if shape_fallback:
@@ -697,43 +684,6 @@ def w2_dedupe_records(records):
     return deduped
 
 
-def w2_debug_page(path: Path, page_num: int):
-    doc = fitz.open(path)
-    if page_num < 1 or page_num > len(doc):
-        print(f"{path.name}: page {page_num} out of range (document has {len(doc)} page(s))")
-        doc.close()
-        return
-    page = doc[page_num - 1]
-
-    text = normalize_text(page.get_text())
-    print(f"--- {path.name} page {page_num} of {len(doc)} ---")
-    print(f"text layer: {len(text.strip())} chars")
-    ssn_caption_count = len(W2_SSN_CAPTION_RE.findall(text))
-    name_caption_count = len(W2_NAME_CAPTION_RE.findall(text))
-    ssn_value_count = len(W2_SSN_VALUE_RE.findall(text))
-    print(f"SSN captions found on page: {ssn_caption_count}")
-    print(f"Name/address captions found on page: {name_caption_count}")
-    print(f"SSN-shaped values found on page: {ssn_value_count}")
-
-    words = page.get_text("words")
-    lines = w2_group_words_into_lines(words)
-    plain_lines = [normalize_text(" ".join(t for _, _, t in ln)) for ln in lines]
-    print(f"lines detected: {len(plain_lines)}")
-    for i, line in enumerate(plain_lines):
-        if W2_SSN_CAPTION_RE.search(line):
-            tag, shown = "  <-- SSN caption", line
-        elif W2_NAME_ONLY_CAPTION_RE.search(line):
-            tag, shown = "  <-- name caption (box e)", line
-        elif W2_ADDRESS_CAPTION_RE.search(line):
-            tag, shown = "  <-- address caption (box f)", line
-        elif W2_COMBINED_NAME_ADDR_CAPTION_RE.search(line):
-            tag, shown = "  <-- combined name/address caption", line
-        elif W2_STOP_LABEL_RE.search(line):
-            tag, shown = "  <-- stop label", line
-        else:
-            tag, shown = "", mask_shape(line)
-        print(f"  [{i:>3}] {shown}{tag}")
-    doc.close()
 
 
 # ===========================================================================
@@ -769,13 +719,6 @@ C1095_ZIP_CAPTION_LEFTOVER_RE = re.compile(r"^(?:\b(?:or|foreign|postal|code)\b\
 C1095_DIAGNOSTIC_TERMS = ["1095-C", "employee", "employer", "social security", "coverage"]
 
 
-def c1095_group_words_into_lines(words, y_tol=3):
-    lines = {}
-    for w in words:
-        x0, y0, x1, y1, text = w[0], w[1], w[2], w[3], w[4]
-        key = round(y0 / y_tol) * y_tol
-        lines.setdefault(key, []).append((x0, x1, text))
-    return [sorted(v, key=lambda t: t[0]) for _, v in sorted(lines.items())]
 
 
 def c1095_split_employee_name(full_name):
@@ -932,7 +875,7 @@ def c1095_process_page(page, page_num, debug=False, pdf_stem=None, output_dir=No
         return None
 
     words = page.get_text("words")
-    lines = c1095_group_words_into_lines(words)
+    lines = group_words_into_lines(words)
     plain_lines = [" ".join(t for _, _, t in ln) for ln in lines]
 
     if debug:
@@ -1016,7 +959,6 @@ CLAIMS_LOOKAHEAD_HEADER = 8
 CLAIMS_LOOKAHEAD_DATA_ROWS = 25
 
 CLAIMS_COLUMNS = ["Patient Name", "Health Plan ID", "Member #", "Claim #", "Pat. Acct #", "Service Date", "CPT Code", "Page"]
-CLAIMS_COMBINED_COLUMNS = ["Source File"] + CLAIMS_COLUMNS
 
 
 def claims_find_name_match(text, pos=0, pattern=CLAIMS_NAME_RE):
@@ -1749,7 +1691,6 @@ def patient_merge_same_patient(rows):
     return passthrough + merged
 
 
-PATIENT_COLUMNS = ["Format", "Patient Name", "Health Plan ID", "Claim #", "Member #", "Pat. Acct #", "Service Date", "Proc", "CPT", "Page"]
 
 
 # ===========================================================================
@@ -1776,16 +1717,8 @@ GP_HEADER_DEFS = [
     ("Total Taxes", ["Total", "Taxes"]),
     ("Net Pay", ["Net", "Pay"]),
 ]
-GP_REPORT_COLUMNS = [label for label, _ in GP_HEADER_DEFS]
 
 
-def gp_group_words_into_lines(words, y_tol=3):
-    lines = {}
-    for w in words:
-        x0, y0, x1, y1, text = w[0], w[1], w[2], w[3], w[4]
-        key = round(y0 / y_tol) * y_tol
-        lines.setdefault(key, []).append((x0, x1, text))
-    return [sorted(v, key=lambda t: t[0]) for _, v in sorted(lines.items())]
 
 
 def gp_find_token_sequence_start(line, tokens):
@@ -1854,7 +1787,7 @@ def gp_process_pdf(path: Path):
         if rotation != 0:
             print(f"[{path.name}] page {i}: detected rotation {rotation} deg, normalizing for extraction")
         words = page.get_text("words")
-        lines = gp_group_words_into_lines(words)
+        lines = group_words_into_lines(words)
         bounds = gp_find_header_bounds(lines)
         if bounds:
             last_bounds = bounds
@@ -2162,36 +2095,6 @@ def k401_merge_exact_duplicates(records: list) -> list:
     return out
 
 
-def k401_deduplicate_extracted(records: list) -> list:
-    if len(records) <= 1:
-        return list(records)
-    out = []
-    for rec in records:
-        fn = rec.first_name.strip()
-        ln = rec.last_name.strip().lower()
-        ssn = rec.ssn.strip()
-        matched = False
-        for primary in out:
-            if primary.ssn.strip() != ssn:
-                continue
-            if primary.last_name.strip().lower() != ln:
-                continue
-            if not k401_first_name_prefix_match(fn, primary.first_name.strip()):
-                continue
-            if len(fn.strip()) > len(primary.first_name.strip()):
-                primary.first_name = fn.strip()
-                primary.middle_name = rec.middle_name or primary.middle_name
-                primary.suffix = rec.suffix or primary.suffix
-            else:
-                if not primary.middle_name and rec.middle_name:
-                    primary.middle_name = rec.middle_name
-                if not primary.suffix and rec.suffix:
-                    primary.suffix = rec.suffix
-            matched = True
-            break
-        if not matched:
-            out.append(rec)
-    return out
 
 
 def k401_parse_name_parts(full_name: str):
@@ -2587,28 +2490,11 @@ def k401_extract(pdf_path: Path, doc_id: str):
         method_str = " + ".join(method_parts) if method_parts else "no-header scan"
         print(f"    [{method_str}] {len(records)} employee record(s) found.")
     else:
-        print(f"    [!] No employee records found -- check PDF layout.")
+        print("    [!] No employee records found -- check PDF layout.")
 
     return records
 
 
-K401_FALLBACK_HEADER = [
-    "DOCID", "Last Name", "First Name", "Middle Name", "Suffix",
-    "Data Subject Type", "Residential Address", "State of Residence (if US)",
-    "Country of Residence", "City", "Province of Residence (if Canada)",
-    "Zip Code", "Address Comments", "Phone Number", "Email Address - Personal",
-    "PI Notes", "Contact Information", "Government- Issued Identification",
-    "Social Security Number", "Passport Number", "Passport Country",
-    "Driver's License Number", "DL Issuing Country",
-    "DL Issuing Province (if Canada)", "DL Issuing State (if US)",
-    "Government-Issued ID Number", "Government ID Issuing Country",
-    "Health Related Information", "Birth Information",
-    "Full Date of Birth (MM/DD/YYYY)", "Financial Account Information",
-    "Access Credentials (Non-Financial Account)", "Biometric Data",
-    "Demographic Information", "Family Information",
-    "Student-Related Information", "Work-Related Information",
-    "Employee Identification Number",
-]
 
 
 # ===========================================================================
@@ -2640,7 +2526,6 @@ def creditor_parse_name(cell: str) -> dict:
     if not s:
         return blank
 
-    tokens = s.split()
     if "," not in s:
         return {**blank, "Last Name": s}
 
@@ -2800,18 +2685,8 @@ def creditor_extract_pdf(pdf_path: Path):
     return all_entries
 
 
-CREDITOR_PARSED_HEADERS = [
-    "First Name", "Last Name", "Middle Name", "Suffix",
-    "Street Address", "City", "State", "ZIP Code", "Page Number",
-]
 
 
-def creditor_parsed_row(e: dict) -> list:
-    nm = creditor_parse_name(e["full_name"])
-    return [
-        _csv_safe(nm["First Name"]), _csv_safe(nm["Last Name"]), _csv_safe(nm["Middle Name"]), _csv_safe(nm["Suffix"]),
-        _csv_safe(e["street"]), _csv_safe(e["city"]), _csv_safe(e["state"]), _csv_safe(e["zipcode"]), e["page_num"],
-    ]
 
 
 # ===========================================================================
@@ -2820,10 +2695,6 @@ def creditor_parsed_row(e: dict) -> list:
 # ===========================================================================
 
 
-B11_OUTPUT_HEADERS = [
-    "DOCID", "Name", "Associate ID", "Position ID", "Home Department",
-    "Home Cost Number", "Changed Field", "Changed From", "Changed To",
-]
 
 B11_LINE_TOLERANCE = 3.0
 B11_NAME_SUFFIXES = {"jr", "sr", "ii", "iii", "iv", "v"}
@@ -2839,30 +2710,6 @@ def b11_normalise(text: str) -> str:
     return " ".join(str(text or "").split()).lower()
 
 
-def b11_parse_name(cell: str) -> dict:
-    blank = {"Last Name": "", "First Name": "", "Middle Name": "", "Suffix": ""}
-    s = _clean(cell)
-    if not s or "," not in s:
-        return blank
-
-    last_part, _, rest = s.partition(",")
-    last_toks = last_part.split()
-    rest_toks = rest.split()
-
-    suffix = ""
-    if rest_toks and rest_toks[-1].strip(".").lower() in B11_NAME_SUFFIXES:
-        suffix = rest_toks[-1]
-        rest_toks = rest_toks[:-1]
-    elif last_toks and last_toks[-1].strip(".").lower() in B11_NAME_SUFFIXES:
-        suffix = last_toks[-1]
-        last_toks = last_toks[:-1]
-
-    return {
-        "Last Name": " ".join(last_toks),
-        "First Name": rest_toks[0] if rest_toks else "",
-        "Middle Name": " ".join(rest_toks[1:]) if len(rest_toks) > 1 else "",
-        "Suffix": suffix,
-    }
 
 
 def b11_group_lines(words):
@@ -3082,71 +2929,12 @@ def b11_extract_changes(pdf_path: Path, debug: bool = False):
     return change_rows, warning, page_count
 
 
-def b11_diagnose(pdf_path: Path, max_pages: int = 3) -> None:
-    print(f"\n=== DIAGNOSE: {pdf_path.name} ===\n")
-    with pdfplumber.open(str(pdf_path)) as pdf:
-        for page_no, page in enumerate(pdf.pages, start=1):
-            if page_no > max_pages:
-                print(f"  (capped at {max_pages} pages -- use --diagnose-pages N)")
-                break
-            words = page.extract_words()
-            pw = float(page.width)
-            lines = b11_group_lines(words)
-            c2, c3 = b11_detect_boundaries(lines, pw)
-            print(f"--- PAGE {page_no}  col2_x={c2:.1f}  col3_x={c3:.1f} (page_width={pw:.1f}) ---")
-            for li, line in enumerate(lines, start=1):
-                raw = b11_line_text(line)
-                tag = ""
-                if b11_is_page_chrome(line):
-                    tag = "  [CHROME]"
-                elif b11_is_table_header(line):
-                    tag = "  [TABLE HEADER]"
-                elif b11_is_employee_header(line):
-                    emp = b11_parse_employee_header(raw)
-                    tag = (f"  [EMP-ID: {emp['Last Name']}, {emp['First Name']}"
-                           f"  assocID={emp['Associate ID']!r}  posID={emp['Position ID']!r}]")
-                elif b11_is_name_line(line, c2):
-                    tag = "  [EMP-NAME]"
-                else:
-                    field, frm, to_ = b11_split_three_cols(line, c2, c3)
-                    if field:
-                        tag = f"  [CHG: {field!r} | {frm!r} -> {to_!r}]"
-                print(f"  L{li:03d}: {raw}{tag}")
-            print()
 
 
-def b11_format_name(record: dict) -> str:
-    last = record.get("Last Name", "").strip()
-    first = record.get("First Name", "").strip()
-    middle = record.get("Middle Name", "").strip()
-    parts = " ".join(filter(None, [first, middle]))
-    return f"{last}, {parts}" if last and parts else last or parts
 
 
-def b11_process_file(pdf_path: Path, debug: bool, log=print):
-    log(f"Processing: {pdf_path.name}")
-    change_rows, warning, pages = b11_extract_changes(pdf_path, debug=debug)
-    if warning:
-        log(f"  WARNING: {warning}")
-    log(f"  Extracted {len(change_rows)} change row(s).")
-    for rec in change_rows:
-        rec["DOCID"] = pdf_path.name
-    return (
-        {"file": pdf_path.name, "records": len(change_rows), "pages": pages,
-         "records_found": "Yes" if change_rows else "No", "warning": warning},
-        change_rows,
-    )
 
 
-# ===========================================================================
-# Interactive mode — tkinter format picker + per-PDF auto-detection
-#
-# Lets you pick one or more formats from a checkbox popup instead of typing a
-# subcommand; the script then sniffs each input PDF's text and only runs the
-# extractor(s) for the format(s) that actually match. Every run_*_on_file()
-# below is a single-file version of what its cmd_* counterpart already does
-# in a loop, reused here so there is one source of truth per format.
-# ===========================================================================
 
 
 def sniff_pdf_text(pdf_path: Path, max_pages: int = 3):
@@ -3214,8 +3002,6 @@ def _sniff_creditor_list(text: str, has_text: bool) -> bool:
     return "mailing matrix" in text or "mailing list" in text or ("creditor" in text and "case no" in text)
 
 
-def _sniff_generic(text: str, has_text: bool) -> bool:
-    return True
 
 
 FORMAT_SNIFFERS = {
@@ -3227,7 +3013,6 @@ FORMAT_SNIFFERS = {
     "claims": _sniff_claims,
     "patient-info": _sniff_patient_info,
     "creditor-list": _sniff_creditor_list,
-    "generic": _sniff_generic,
 }
 
 
@@ -3430,18 +3215,6 @@ PII_COLUMNS = [
 ]
 
 
-def split_last_first_middle(name: str) -> dict:
-    """'Last, First Middle' -> name parts; anything without a comma stays in Full Name."""
-    name = _clean(name)
-    if "," in name:
-        last, rest = name.split(",", 1)
-        parts = rest.split()
-        return {
-            "Last Name": _clean(last),
-            "First Name": parts[0] if parts else "",
-            "Middle Name": " ".join(parts[1:]),
-        }
-    return {"Full Name": name} if name else {}
 
 
 NAME_SUFFIXES = {"jr": "Jr", "sr": "Sr", "ii": "II", "iii": "III", "iv": "IV", "v": "V"}
@@ -3540,9 +3313,8 @@ def pick_cpt_code(raw: str) -> str:
 def _row(**fields) -> dict:
     out = {}
     for k, v in fields.items():
-        if k not in PII_COLUMNS or not _clean(v):
-            continue
-        out[k] = _clean(v)
+        if k in PII_COLUMNS and (text := _clean(v)):
+            out[k] = text
     return finalize_row(out)
 
 
@@ -3752,7 +3524,6 @@ FORMAT_CHOICES = [
 FORMAT_LABELS = dict(FORMAT_CHOICES)
 FORMAT_PRIORITY = [key for key, _ in FORMAT_CHOICES]
 FORMAT_SNIFFERS.update({"1099": _sniff_1099, "adp-paystub": _sniff_adp_paystub})
-FORMAT_SNIFFERS.pop("generic", None)
 
 
 # ===========================================================================
@@ -3779,18 +3550,22 @@ def write_pii_xlsx(rows: list, out_path: Path) -> None:
     wb = openpyxl.Workbook()
     ws = wb.active
     ws.title = "Extracted"
-    ws.append(columns)
-    for cell in ws[1]:
-        cell.font = Font(bold=True)
+    bold = Font(bold=True)
+    widths = [len(c) for c in columns]
+    for ci, col in enumerate(columns, start=1):
+        cell = ws.cell(row=1, column=ci, value=col)
+        cell.font = bold
         cell.number_format = "@"
-    for row in rows:
-        ws.append([str(row.get(c, "")) for c in columns])
-        for cell in ws[ws.max_row]:
+    for ri, row in enumerate(rows, start=2):
+        for ci, col in enumerate(columns, start=1):
+            text = str(row.get(col, ""))
+            cell = ws.cell(row=ri, column=ci, value=text)
             cell.data_type = "s"  # never a formula, even when the text starts with "=" or "-"
             cell.number_format = "@"
-    for i, col in enumerate(columns, start=1):
-        width = max(len(col), *(len(str(r.get(col, ""))) for r in rows)) + 2
-        ws.column_dimensions[openpyxl.utils.get_column_letter(i)].width = min(width, 60)
+            if len(text) > widths[ci - 1]:
+                widths[ci - 1] = len(text)
+    for ci, width in enumerate(widths, start=1):
+        ws.column_dimensions[openpyxl.utils.get_column_letter(ci)].width = min(width + 2, 60)
     ws.freeze_panes = "A2"
     out_path.parent.mkdir(parents=True, exist_ok=True)
     wb.save(out_path)
