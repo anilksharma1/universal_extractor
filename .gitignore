@@ -1,0 +1,5 @@
+.env
+*.env
+__pycache__/
+*_extracted.xlsx
+*extraction summary.xlsx
