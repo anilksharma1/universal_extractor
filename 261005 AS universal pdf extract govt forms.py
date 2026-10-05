@@ -313,7 +313,11 @@ def w2_find_name_address(lines, page_num, column_label):
     right_xs = [b for b in (w2_find_right_column_boundary_strict(ln) for ln in lines[:block_end])
                 if b is not None and b >= left_x + 100]  # a box caption at the left margin is not a right column
     right_x = min(right_xs) if right_xs else None
-    clipped = [normalize_text(w2_row_text_left_of(ln, right_x)) for ln in lines]
+    # Rows that only hold text from a side-by-side panel (e.g. a "Box 1 of W-2" header printed to the right of the
+    # name block) start far right of the caption's own left edge; blank them so they aren't read as name/address.
+    cap_x0 = lines[cap_idx][0][0] if cap_idx is not None and lines[cap_idx] else left_x
+    clipped = [normalize_text(w2_row_text_left_of(ln, right_x)) if ln and ln[0][0] <= cap_x0 + W2_PANEL_GAP else ""
+               for ln in lines]
     for i, line in enumerate(plain_lines):
         if W2_COMBINED_NAME_ADDR_CAPTION_RE.search(line):
             return _w2_find_name_address_combined_box(clipped, i, page_num, column_label)
