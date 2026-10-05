@@ -1843,6 +1843,7 @@ K401_TEMPLATE_COL_COUNT = 38
 
 K401_SSN_RE = re.compile(r'\b(\d{3})-(\d{2})-(\d{4})\b')
 K401_SSN_RE_XPAD = re.compile(r'(?<!\d)(\d{3})-(\d{2})-([\dxX*]{1,4})(?![\dxX*])', re.I)
+K401_AMOUNT_SIGNED_RE = re.compile(r'\(?-?\$?\s*(?:\d{1,3}(?:,\d{3})+(?:\.\d+)?|\d+(?:\.\d+)?)\)?')
 K401_AMOUNT_RE = re.compile(r'\$?\s*([\d]{1,3}(?:,\d{3})+(?:\.\d{1,2})?|\d+(?:\.\d{1,2})?)')
 K401_NAME_RE = re.compile(r'\b([A-Z][a-z]+(?:[ \t]+[A-Z][a-z]*\.?){1,4})\b')
 K401_NAME_RE_UPPER = re.compile(r'\b([A-Z]{2,}(?:[ \t]+[A-Z]{2,}){1,4})\b')
@@ -1944,7 +1945,7 @@ def k401_fmt_ssn(raw: str) -> str:
 
 
 def k401_parse_amount(text: str) -> str:
-    m = K401_AMOUNT_RE.search(_clean(text))
+    m = K401_AMOUNT_SIGNED_RE.search(_clean(text))
     return m.group(0).replace(" ", "") if m else ""
 
 
@@ -1971,7 +1972,7 @@ def k401_find_name_in_text(text: str) -> str:
     if m:
         candidate = f"{m.group(1)}, {m.group(2)}"
         if _ok(candidate.replace(",", "")):
-            return candidate.title()
+            return candidate
 
     stripped = K401_LABEL_STRIP_RE.sub('', text)
     stripped = re.sub(r'\b\d[\d,.$%-]*\b', '', stripped)
@@ -1980,7 +1981,7 @@ def k401_find_name_in_text(text: str) -> str:
     if m:
         candidate = m.group(1)
         if _ok(candidate):
-            return candidate.title()
+            return candidate
 
     m = K401_NAME_RE.search(text)
     if m:
@@ -2115,15 +2116,15 @@ def k401_parse_name_parts(full_name: str):
     if not name:
         return ("", "", "", "")
     if "," not in name:
-        return ("", "", name.title(), "")
+        return ("", "", name, "")
     last_part, _, rest_part = name.partition(",")
-    last = last_part.strip().title()
+    last = last_part.strip()
     rest = rest_part.strip().split()
     suffix = ""
     if rest and rest[-1].lower().rstrip(".") in K401_SUFFIXES:
-        suffix = rest.pop().title()
-    first = rest[0].title() if rest else ""
-    middle = " ".join(w.title() for w in rest[1:]) if len(rest) > 1 else ""
+        suffix = rest.pop()
+    first = rest[0] if rest else ""
+    middle = " ".join(w for w in rest[1:]) if len(rest) > 1 else ""
     return (first, middle, last, suffix)
 
 
@@ -2161,13 +2162,13 @@ class K401EmployeeRecord:
             if not self.last_name: self.last_name = last
             if not self.suffix: self.suffix = suffix
         elif canonical == "first_name" and not self.first_name:
-            self.first_name = value.title()
+            self.first_name = value
         elif canonical == "middle_name" and not self.middle_name:
-            self.middle_name = value.title()
+            self.middle_name = value
         elif canonical == "last_name" and not self.last_name:
-            self.last_name = value.title()
+            self.last_name = value
         elif canonical == "suffix" and not self.suffix:
-            self.suffix = value.title()
+            self.suffix = value
         elif canonical == "ssn" and not self.ssn:
             self.ssn = k401_fmt_ssn(value)
         elif canonical == "gross_salary" and not self.gross_salary:
@@ -2365,10 +2366,10 @@ K401_LABEL_PATS = {
     "middle_name": re.compile(r'middle\s+(?:name|initial)\s*[:\-]?\s*(.+)', re.I),
     "suffix": re.compile(r'(?:name\s+)?suffix\s*[:\-]?\s*(.+)', re.I),
     "ssn": re.compile(r'(?:ssn|ss#|social\s+security(?:\s+number)?|tax\s+id)\s*[:\-#]?\s*([\d\- ]+)', re.I),
-    "gross_salary": re.compile(r'(?:gross\s+(?:salary|pay|wages?|comp(?:ensation)?)|annual\s+salary|salary)\s*[:\-]?\s*([\$\d,\.]+)', re.I),
-    "ee_contribution": re.compile(r'(?:ee\s+(?:contribution|deferral)|employee\s+(?:contribution|deferral|401k)|elective\s+deferral)\s*[:\-]?\s*([\$\d,\.]+)', re.I),
-    "er_match": re.compile(r'(?:er\s+match|employer\s+(?:match|contribution)|company\s+match)\s*[:\-]?\s*([\$\d,\.]+)', re.I),
-    "ytd_contribution": re.compile(r'(?:ytd\s+(?:contribution|total|deferral)|year\s+to\s+date)\s*[:\-]?\s*([\$\d,\.]+)', re.I),
+    "gross_salary": re.compile(r'(?:gross\s+(?:salary|pay|wages?|comp(?:ensation)?)|annual\s+salary|salary)\s*[:\-]?\s*((?=[\$\(\-]*\d)[\$\d,\.\(\)\-]+)', re.I),
+    "ee_contribution": re.compile(r'(?:ee\s+(?:contribution|deferral)|employee\s+(?:contribution|deferral|401k)|elective\s+deferral)\s*[:\-]?\s*((?=[\$\(\-]*\d)[\$\d,\.\(\)\-]+)', re.I),
+    "er_match": re.compile(r'(?:er\s+match|employer\s+(?:match|contribution)|company\s+match)\s*[:\-]?\s*((?=[\$\(\-]*\d)[\$\d,\.\(\)\-]+)', re.I),
+    "ytd_contribution": re.compile(r'(?:ytd\s+(?:contribution|total|deferral)|year\s+to\s+date)\s*[:\-]?\s*((?=[\$\(\-]*\d)[\$\d,\.\(\)\-]+)', re.I),
     "ee_id": re.compile(r'(?:employee\s+(?:id|number|identification)|ee\s+id|emp\s+(?:id|number))\s*[:\-#]?\s*([A-Z0-9\-]+)', re.I),
 }
 
@@ -3231,7 +3232,7 @@ PII_COLUMNS = [
 
 
 NAME_SUFFIXES = {"jr": "Jr", "sr": "Sr", "ii": "II", "iii": "III", "iv": "IV", "v": "V"}
-NAME_FILLER_WORDS = {"medi-cal", "medicare", "commercial", "medi-medi", "payee", "payee:", "pat", "pat."}
+NAME_FILLER_WORDS = {"medi-cal", "medicare", "commercial", "medi-medi", "payee", "payee:"}
 DATE_OF_BIRTH_COLUMNS = {"Date of Birth"}
 
 
@@ -3600,33 +3601,58 @@ GENERIC_ILLEGAL_RE = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f]")
 
 
 def extract_generic_rows(pdf: Path):
-    """Return (headers, matrix): every table row on every page, plus the text lines of pages that have no
-    table. headers is File Name, Page Number, then Col_1..Col_n (or 'Extracted Text' when there are no
-    tables at all). Returns (None, []) when the PDF has neither tables nor a text layer."""
+    """Return (headers, matrix): every table row on every page, plus the text lines that sit outside the
+    tables (page titles, 'Invoice No', ...) in page order, and all text lines of pages with no table.
+    headers is File Name, Page Number, then Col_1..Col_n (or 'Extracted Text' when there are no tables at
+    all). Returns (None, []) when the PDF has neither tables nor a text layer."""
+
+    def clean_cell(value) -> str:
+        return GENERIC_ILLEGAL_RE.sub("", str(value)).replace("\n", " ") if value is not None else ""
+
     rows = []  # (page_number, cells)
     has_tables = False
     with pdfplumber.open(str(pdf)) as doc:
         for page_num, page in enumerate(doc.pages, start=1):
+            items, bboxes = [], []  # items: (vertical position, cells)
             try:
-                tables = page.extract_tables()
+                found = page.find_tables()
             except Exception:
-                tables = []
-            page_has_rows = False
-            for table in tables:
-                for row in table:
-                    cells = [GENERIC_ILLEGAL_RE.sub("", str(c)).replace("\n", " ") if c is not None else ""
-                             for c in row]
+                found = []
+            for table in found:
+                try:
+                    data = table.extract()
+                except Exception:
+                    continue
+                table_rows = getattr(table, "rows", [])
+                added = False
+                for r, row in enumerate(data):
+                    cells = [clean_cell(c) for c in row]
                     if any(c.strip() for c in cells):
-                        rows.append((page_num, cells))
-                        page_has_rows = has_tables = True
-            if not page_has_rows:  # no table on this page: keep its text lines as rows
+                        top = table_rows[r].bbox[1] if r < len(table_rows) else table.bbox[1]
+                        items.append((top, cells))
+                        added = True
+                if added:
+                    bboxes.append(table.bbox)
+                    has_tables = True
+            if bboxes:  # text outside the tables
+                try:
+                    text_lines = page.extract_text_lines(layout=False, strip=True)
+                except Exception:
+                    text_lines = []
+                for ln in text_lines:
+                    mid = (ln["top"] + ln["bottom"]) / 2
+                    inside = any(b[1] - 1 <= mid <= b[3] + 1 and b[0] - 1 <= ln["x0"] <= b[2] + 1 for b in bboxes)
+                    if not inside and ln["text"].strip():
+                        items.append((ln["top"], [clean_cell(ln["text"])]))
+                items.sort(key=lambda it: it[0])
+            else:  # no table on this page: keep its text lines
                 try:
                     text = page.extract_text(layout=True) or ""
                 except Exception:
                     text = ""
-                for line in text.split("\n"):
-                    if line.strip():
-                        rows.append((page_num, [GENERIC_ILLEGAL_RE.sub("", line.rstrip())]))
+                items = [(i, [GENERIC_ILLEGAL_RE.sub("", line).strip()])
+                         for i, line in enumerate(text.split("\n")) if line.strip()]
+            rows.extend((page_num, cells) for _, cells in items)
     if not rows:
         return None, []
     width = max(len(cells) for _, cells in rows)
@@ -3638,6 +3664,22 @@ def extract_generic_rows(pdf: Path):
 
 SUMMARY_HEADERS = ["File Name", "Document Type", "Pages", "Time Taken (s)", "Records", "Extracted Columns",
                    "Status", "Output File", "Reason Not Extracted"]
+
+
+_TESSERACT_OK = None
+
+
+def tesseract_available() -> bool:
+    """True when pytesseract AND the Tesseract program are both present (checked once)."""
+    global _TESSERACT_OK
+    if _TESSERACT_OK is None:
+        try:
+            import pytesseract
+            pytesseract.get_tesseract_version()
+            _TESSERACT_OK = True
+        except Exception:
+            _TESSERACT_OK = False
+    return _TESSERACT_OK
 
 
 def pdf_page_count(pdf: Path) -> str:
@@ -3705,6 +3747,8 @@ def main() -> int:
         sys.exit("ERROR: openpyxl is required. Run: pip install openpyxl")
     if not HAS_PYPDF:
         print("WARNING: pypdf not installed -- 401k AcroForm extraction skipped. Run: pip install pypdf")
+    if not tesseract_available():
+        print("NOTE: Tesseract OCR is not installed -- scanned / image-only pages cannot be read.")
 
     input_path = Path(args.input)
     if not input_path.exists():
@@ -3713,7 +3757,7 @@ def main() -> int:
     if not pdf_files:
         sys.exit(f"ERROR: no .pdf files found at {input_path}")
 
-    unmatched, failed, written = [], [], 0
+    unmatched, fallback_off, failed, written = [], [], [], 0
     summary = []
 
     for pdf in tqdm(pdf_files, desc="Extracting", unit="file"):
@@ -3759,7 +3803,7 @@ def main() -> int:
 
         if fmt is None:
             if args.format == "auto" and args.no_fallback:
-                unmatched.append(pdf.name)
+                fallback_off.append(pdf.name)
                 finish(**{"Document Type": "Not recognised",
                           "Reason Not Extracted": "No document type matched (rows/tables fallback is off)"})
                 continue
@@ -3781,8 +3825,13 @@ def main() -> int:
             if args.format == "auto" and not args.no_fallback and generic_fallback():
                 continue
             print(f"  {pdf.name} -> [{FORMAT_LABELS[fmt]}] no records -- no file written")
-            finish(**{"Document Type": FORMAT_LABELS[fmt],
-                      "Reason Not Extracted": "Document type recognised but no records could be read, and no tables or text rows were found either (blank or scanned?)"})
+            if not sniff_pdf_text(pdf)[1]:  # no usable text layer: it was only routed to OCR as a guess
+                finish(**{"Document Type": "No text layer (blank or scanned)",
+                          "Reason Not Extracted": "No text layer and no tables (blank or scanned page); OCR is needed"
+                                                  + ("" if tesseract_available() else " but Tesseract is not installed")})
+            else:
+                finish(**{"Document Type": FORMAT_LABELS[fmt],
+                          "Reason Not Extracted": "Document type recognised but no records could be read from it, and no tables or text rows were found either"})
             continue
         columns = write_pii_xlsx(rows, out_path)
         written += 1
@@ -3805,6 +3854,10 @@ def main() -> int:
         print(f"Summary: {len(summary)} document(s), {len(summary) - missed} extracted, {missed} not extracted "
               f"-> {summary_path.name}")
 
+    if fallback_off:
+        print(f"\nNo document type matched and the rows/tables fallback is off ({len(fallback_off)} file(s), skipped):")
+        for name in fallback_off:
+            print(f"  - {name}")
     if unmatched:
         print(f"\nNothing extracted -- no document type, tables or text found ({len(unmatched)} file(s), skipped):")
         for name in unmatched:
