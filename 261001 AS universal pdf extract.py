@@ -29,7 +29,7 @@ VALUES ARE KEPT EXACTLY AS THE DOCUMENT PRINTS THEM
 OVERLAP WITH THE TABLE ENGINE (--compare-engines, opt-in)
     For payroll changes, Gross-To-Net, 401k and paystub PDFs: if the PDF carries the identifier "ADP" the
     dedicated extractor is used (priority rule). Otherwise the PDF is also run through
-    PDFWithTableConvertToExcelTool/doc_reader_v2.py and the engine that extracts more is kept; Azure OpenAI
+    doc_reader_v2.py (next to this script) and the engine that extracts more is kept; Azure OpenAI
     judges, shown column names and counts only (never values), and the larger value count decides when it is
     unavailable. The reason is written to the summary's "Detection Note" column. This sends those PDFs to your
     Azure tenant, so it is off by default; claims / patient-info are never sent.
@@ -3923,7 +3923,7 @@ def extract_ai_rows(pdf: Path):
 
 # ===========================================================================
 # Overlap rule (--compare-engines): dedicated extractor vs the table engine
-# (PDFWithTableConvertToExcelTool/doc_reader_v2.py: Azure Document Intelligence + Azure OpenAI)
+# (doc_reader_v2.py, next to this script: Azure Document Intelligence + Azure OpenAI)
 #   1. A PDF that carries the identifier "ADP" goes to the dedicated extractor first.
 #   2. Otherwise both run and the one that extracts more is kept. The judge is Azure OpenAI, shown ONLY
 #      column names and counts (never values); without it, the larger value count wins.
@@ -3975,8 +3975,7 @@ def run_table_engine(pdf: Path):
     """Run the table engine on one PDF in a temp folder. Returns (tables, why): tables is a list of
     (sheet name, matrix) -- possibly empty -- or None with the reason it could not run."""
     import importlib.util
-    path = Path(os.environ.get("TABLE_ENGINE_PATH") or Path(__file__).resolve().parent
-                / "PDFWithTableConvertToExcelTool" / "doc_reader_v2.py")
+    path = Path(os.environ.get("TABLE_ENGINE_PATH") or Path(__file__).resolve().parent / "doc_reader_v2.py")
     if not path.is_file():
         return None, f"engine file not found: {path.name}"
     try:
@@ -4153,7 +4152,7 @@ def main() -> int:
     parser.add_argument("--compare-engines", action="store_true",
                         help="For the 4 types the table engine also covers (payroll changes, Gross-To-Net, 401k, "
                              "paystub): PDFs carrying 'ADP' use the dedicated extractor; others are also run through "
-                             "PDFWithTableConvertToExcelTool/doc_reader_v2.py (Azure Document Intelligence + Azure "
+                             "doc_reader_v2.py next to this script (Azure Document Intelligence + Azure "
                              "OpenAI) and the engine that extracts more is kept. Sends those PDFs to your Azure tenant.")
     args = parser.parse_args()
 
