@@ -131,12 +131,13 @@ W2_MIN_TEXT_CHARS_PER_PAGE = 20
 
 W2_NAME_SUFFIXES = {"JR", "SR", "II", "III", "IV", "V"}
 
-W2_SSN_CAPTION_RE = re.compile(r"Employee.?s\s+(?:social security number|SSN)\b", re.IGNORECASE)
+W2_SSN_CAPTION_RE = re.compile(r"Employee.?s\s+(?:social security number|SSN|SSA number)\b", re.IGNORECASE)
 W2_NAME_ONLY_CAPTION_RE = re.compile(r"Employee.?s\s+first name and initial\b", re.IGNORECASE)
 W2_COMBINED_NAME_ADDR_CAPTION_RE = re.compile(r"Employee.?s\s+name,\s*address", re.IGNORECASE)
 W2_ADDRESS_CAPTION_RE = re.compile(r"\bf\s+Employee.?s address\b", re.IGNORECASE)
 W2_STOP_LABEL_RE = re.compile(
     r"^(?:\d{1,2}\s+State\b|Employer.s state ID|Local income tax|Locality name|"
+    r"[a-f]\s+Employer.s\b|[a-f]\s+Employee.s\s+(?:SSN|SSA|social security)|Employer.s (?:name|FED|federal)|"
     r"Form\s*W-?2\b|Wage\s*(?:&|and)\s*Tax Statement|Copy\s+[A-Z0-9]|"
     r"For (?:Official|Privacy)|Department of the Treasury|20\d{2}$)",
     re.IGNORECASE,
@@ -216,9 +217,17 @@ def w2_find_right_column_boundary_strict(word_line):
     return None
 
 
+W2_PANEL_GAP = 40  # a horizontal gap this wide inside one row separates side-by-side panels (e.g. a copy of the name block)
+
+
 def w2_row_text_left_of(word_line, max_x):
     words = word_line if max_x is None else [w for w in word_line if w[0] < max_x]
-    return normalize_text(" ".join(t for _, _, t in words))
+    kept = []
+    for w in words:
+        if kept and w[0] - kept[-1][1] > W2_PANEL_GAP:
+            break
+        kept.append(w)
+    return normalize_text(" ".join(t for _, _, t in kept))
 
 
 def w2_find_e_box_dimensions(caption_word_line):
@@ -296,7 +305,12 @@ def w2_find_name_address(lines, page_num, column_label):
     # Boxes 5/6/12 sit in a column to the right of the name/address box: clip every row at that column's x
     # (taken from the numbered captions), so values printed without a caption on their row are cut too.
     left_x = min((w[0] for ln in lines for w in ln), default=0)
-    right_xs = [b for b in (w2_find_right_column_boundary_strict(ln) for ln in lines)
+    cap_idx = next((i for i, l in enumerate(plain_lines) if W2_COMBINED_NAME_ADDR_CAPTION_RE.search(l)), None)
+    block_end = len(lines)
+    if cap_idx is not None:  # only captions beside the name block count; boxes below its stop label don't
+        block_end = next((i for i in range(cap_idx + 1, len(plain_lines))
+                          if W2_STOP_LABEL_RE.search(plain_lines[i])), len(lines))
+    right_xs = [b for b in (w2_find_right_column_boundary_strict(ln) for ln in lines[:block_end])
                 if b is not None and b >= left_x + 100]  # a box caption at the left margin is not a right column
     right_x = min(right_xs) if right_xs else None
     clipped = [normalize_text(w2_row_text_left_of(ln, right_x)) for ln in lines]
