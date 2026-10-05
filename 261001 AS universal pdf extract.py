@@ -26,8 +26,14 @@ VALUES ARE KEPT EXACTLY AS THE DOCUMENT PRINTS THEM
     reformats a number, date or SSN. A column is written only when it has a value
     in that file.
 
+RUN SUMMARY
+    Each run also writes "<yymmdd> AS extraction summary.xlsx" (next to the input, or in -o): one row per
+    document with file name, document type, pages, time taken, records, extracted columns, status and
+    output file, plus a "Not Extracted" sheet listing every document that produced nothing and why.
+    It holds column names and counts only, never extracted values. Use --no-summary to skip it.
+
 LAST RESORT: ROWS / TABLES
-    A PDF that matches none of the document types above is not skipped: its tables are copied row by
+    A PDF that matches none of the document types above (or matches one but yields no records) is not skipped: its tables are copied row by
     row (Col_1, Col_2, ...) and pages without a table contribute their text lines ("Extracted Text"),
     exactly as printed -- the old pdf_extractor.py behaviour. Use --no-fallback to turn this off, or
     --format generic to force it. Scanned PDFs with no text layer are listed at the end instead.
@@ -49,6 +55,7 @@ import argparse
 import re
 import sys
 import tempfile
+import time
 import unicodedata
 from datetime import datetime
 from pathlib import Path
@@ -3571,6 +3578,7 @@ def _write_text_xlsx(headers: list, matrix: list, out_path: Path) -> None:
     ws.freeze_panes = "A2"
     out_path.parent.mkdir(parents=True, exist_ok=True)
     wb.save(out_path)
+    return headers
 
 
 def write_pii_xlsx(rows: list, out_path: Path) -> None:
@@ -3578,7 +3586,7 @@ def write_pii_xlsx(rows: list, out_path: Path) -> None:
     kept in PII_COLUMNS order. Every cell is stored as Text, so Excel never strips leading zeros or
     reformats numbers, dates or SSNs."""
     columns = [c for c in PII_COLUMNS if c == "File Name" or any(row.get(c) for row in rows)]
-    _write_text_xlsx(columns, [[str(row.get(c, "")) for c in columns] for row in rows], out_path)
+    return _write_text_xlsx(columns, [[str(row.get(c, "")) for c in columns] for row in rows], out_path)
 
 
 # ===========================================================================
@@ -3628,6 +3636,50 @@ def extract_generic_rows(pdf: Path):
     return headers, matrix
 
 
+SUMMARY_HEADERS = ["File Name", "Document Type", "Pages", "Time Taken (s)", "Records", "Extracted Columns",
+                   "Status", "Output File", "Reason Not Extracted"]
+
+
+def pdf_page_count(pdf: Path) -> str:
+    try:
+        with fitz.open(pdf) as doc:
+            return str(doc.page_count)
+    except Exception:
+        return ""  # unreadable or password protected
+
+
+def write_summary_xlsx(entries: list, out_path: Path) -> None:
+    """Run summary (column names and counts only -- no extracted values): sheet 'Summary' lists every
+    document; sheet 'Not Extracted' lists the ones that produced no output and why."""
+    wb = openpyxl.Workbook()
+    bold = Font(bold=True)
+
+    def fill(ws, headers, matrix):
+        widths = [len(h) for h in headers]
+        for ci, h in enumerate(headers, start=1):
+            c = ws.cell(row=1, column=ci, value=h)
+            c.font, c.number_format = bold, "@"
+        for ri, values in enumerate(matrix, start=2):
+            for ci, text in enumerate(values, start=1):
+                c = ws.cell(row=ri, column=ci, value=text)
+                c.data_type, c.number_format = "s", "@"
+                widths[ci - 1] = max(widths[ci - 1], len(text))
+        for ci, w in enumerate(widths, start=1):
+            ws.column_dimensions[openpyxl.utils.get_column_letter(ci)].width = min(w + 2, 70)
+        ws.freeze_panes = "A2"
+
+    summary = wb.active
+    summary.title = "Summary"
+    fill(summary, SUMMARY_HEADERS, [[e.get(h, "") for h in SUMMARY_HEADERS] for e in entries])
+    missed = [e for e in entries if e["Status"] != "Extracted"]
+    not_extracted = wb.create_sheet("Not Extracted")
+    fill(not_extracted, ["File Name", "Document Type", "Pages", "Reason Not Extracted"],
+         [[e["File Name"], e.get("Document Type", ""), e.get("Pages", ""), e.get("Reason Not Extracted", "")]
+          for e in missed] or [["(none)", "", "", ""]])
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    wb.save(out_path)
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(
         description="Extract PII/PHI values from PDFs of any supported type into one "
@@ -3639,6 +3691,8 @@ def main() -> int:
     parser.add_argument("--format", default="auto", choices=["auto", "generic"] + FORMAT_PRIORITY,
                         help="Force one document type for every file instead of auto-detecting "
                              "('generic' = rows/tables extraction only)")
+    parser.add_argument("--no-summary", action="store_true",
+                        help="Do not write the run summary workbook")
     parser.add_argument("--no-fallback", action="store_true",
                         help="Do not use the rows/tables extractor for PDFs that match no document type")
     args = parser.parse_args()
@@ -3660,43 +3714,81 @@ def main() -> int:
         sys.exit(f"ERROR: no .pdf files found at {input_path}")
 
     unmatched, failed, written = [], [], 0
+    summary = []
+
     for pdf in tqdm(pdf_files, desc="Extracting", unit="file"):
+        t0 = time.perf_counter()
+        entry = {"File Name": pdf.name, "Pages": pdf_page_count(pdf), "Records": "0", "Extracted Columns": "",
+                 "Status": "Not extracted", "Output File": "", "Reason Not Extracted": "", "Document Type": ""}
+
+        def finish(**fields):
+            entry.update(fields)
+            entry["Time Taken (s)"] = f"{time.perf_counter() - t0:.2f}"
+            summary.append(entry)
+
         if args.format == "generic":
             fmt = None
         else:
             fmt = args.format if args.format != "auto" else detect_format_for_file(pdf, FORMAT_PRIORITY)
-        if fmt is None:
-            if args.format == "auto" and args.no_fallback:
-                unmatched.append(pdf.name)
-                continue
-            # last resort: no document type matched, so copy the rows / tables as they are
+        out_dir = Path(args.output_dir) if args.output_dir else pdf.parent
+        out_path = out_dir / f"{pdf.stem}_extracted.xlsx"
+
+        def generic_fallback() -> bool:
+            """Copy the rows / tables as they are. True when the file was handled (written or failed)."""
             try:
                 headers, matrix = extract_generic_rows(pdf)
             except Exception as exc:
                 failed.append(f"{pdf.name}: {exc}")
-                continue
+                finish(**{"Document Type": "Rows/tables (last-resort)", "Reason Not Extracted": f"Error: {exc}"})
+                return True
             if not matrix:
-                unmatched.append(pdf.name)  # no tables and no text layer (scanned)
-                continue
-            out_dir = Path(args.output_dir) if args.output_dir else pdf.parent
-            out_path = out_dir / f"{pdf.stem}_extracted.xlsx"
-            _write_text_xlsx(headers, matrix, out_path)
+                return False
+            columns = _write_text_xlsx(headers, matrix, out_path)
+            nonlocal written
             written += 1
             print(f"  {pdf.name} -> [Rows/tables (last-resort)] {len(matrix)} row(s) -> {out_path.name}")
+            finish(**{"Document Type": "Rows/tables (last-resort)", "Records": str(len(matrix)),
+                      "Extracted Columns": ", ".join(columns), "Status": "Extracted", "Output File": out_path.name})
+            return True
+
+        if not entry["Pages"]:
+            failed.append(f"{pdf.name}: file could not be opened (corrupt or password protected)")
+            finish(**{"Document Type": "Unreadable PDF",
+                      "Reason Not Extracted": "File could not be opened (corrupt or password protected)"})
             continue
+
+        if fmt is None:
+            if args.format == "auto" and args.no_fallback:
+                unmatched.append(pdf.name)
+                finish(**{"Document Type": "Not recognised",
+                          "Reason Not Extracted": "No document type matched (rows/tables fallback is off)"})
+                continue
+            # last resort: no document type matched, so copy the rows / tables as they are
+            if not generic_fallback():
+                unmatched.append(pdf.name)  # no tables and no text layer (scanned)
+                finish(**{"Document Type": "Not recognised",
+                          "Reason Not Extracted": "No document type matched and no tables or text layer found (scanned?)"})
+            continue
+
         try:
             rows = dedupe_rows([{"File Name": pdf.name, **r} for r in EXTRACTORS[fmt](pdf)])
         except Exception as exc:
             failed.append(f"{pdf.name}: {exc}")
+            finish(**{"Document Type": FORMAT_LABELS[fmt], "Reason Not Extracted": f"Error: {exc}"})
             continue
         if not rows:
+            # the matched type found nothing: last resort is still to copy whatever rows / tables exist
+            if args.format == "auto" and not args.no_fallback and generic_fallback():
+                continue
             print(f"  {pdf.name} -> [{FORMAT_LABELS[fmt]}] no records -- no file written")
+            finish(**{"Document Type": FORMAT_LABELS[fmt],
+                      "Reason Not Extracted": "Document type recognised but no records could be read, and no tables or text rows were found either (blank or scanned?)"})
             continue
-        out_dir = Path(args.output_dir) if args.output_dir else pdf.parent
-        out_path = out_dir / f"{pdf.stem}_extracted.xlsx"
-        write_pii_xlsx(rows, out_path)
+        columns = write_pii_xlsx(rows, out_path)
         written += 1
         print(f"  {pdf.name} -> [{FORMAT_LABELS[fmt]}] {len(rows)} record(s) -> {out_path.name}")
+        finish(**{"Document Type": FORMAT_LABELS[fmt], "Records": str(len(rows)),
+                  "Extracted Columns": ", ".join(columns), "Status": "Extracted", "Output File": out_path.name})
 
     if written:
         print(f"\nDone. {written} Excel file(s) written.")
@@ -3704,6 +3796,14 @@ def main() -> int:
               "folder; Claude conversations are not a secure record.")
     else:
         print("\nNo records extracted. No file written.")
+
+    if not args.no_summary and summary:
+        folder = Path(args.output_dir) if args.output_dir else (input_path if input_path.is_dir() else input_path.parent)
+        summary_path = folder / f"{datetime.now():%y%m%d} AS extraction summary.xlsx"
+        write_summary_xlsx(summary, summary_path)
+        missed = sum(1 for e in summary if e["Status"] != "Extracted")
+        print(f"Summary: {len(summary)} document(s), {len(summary) - missed} extracted, {missed} not extracted "
+              f"-> {summary_path.name}")
 
     if unmatched:
         print(f"\nNothing extracted -- no document type, tables or text found ({len(unmatched)} file(s), skipped):")
