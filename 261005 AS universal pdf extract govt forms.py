@@ -247,7 +247,7 @@ def w2_split_name_row(word_line, last_x0, suff_x0, max_x):
     words = word_line if max_x is None else [w for w in word_line if w[0] < max_x]
     join = lambda ws: normalize_text(" ".join(t for _, _, t in ws))
     if last_x0 is None:
-        return join(words), "", ""
+        return w2_split_name_by_whitespace(join(words))
     first_words = [w for w in words if w[0] < last_x0]
     if suff_x0 is not None:
         last_words = [w for w in words if last_x0 <= w[0] < suff_x0]
@@ -255,24 +255,31 @@ def w2_split_name_row(word_line, last_x0, suff_x0, max_x):
     else:
         last_words = [w for w in words if w[0] >= last_x0]
         suff_words = []
-    return join(first_words), join(last_words), join(suff_words)
+    # Box e's first column is "First name and initial": the first word is the first name, the rest the middle.
+    first_tokens = join(first_words).split()
+    first = first_tokens[0] if first_tokens else ""
+    middle = " ".join(first_tokens[1:])
+    return first, middle, join(last_words), join(suff_words)
 
 
 def w2_split_name_by_whitespace(name):
+    """Return (first, middle, last, suffix) from a single printed name line."""
     tokens = name.split()
     suffix = ""
     if tokens and tokens[-1].strip(".").upper() in W2_NAME_SUFFIXES:
         suffix = tokens[-1]
         tokens = tokens[:-1]
     if not tokens:
-        return "", "", suffix
+        return "", "", "", suffix
     if len(tokens) == 1:
-        return tokens[0], "", suffix
-    return " ".join(tokens[:-1]), tokens[-1], suffix
+        return tokens[0], "", "", suffix
+    if len(tokens) == 2:
+        return tokens[0], "", tokens[1], suffix
+    return tokens[0], " ".join(tokens[1:-1]), tokens[-1], suffix
 
 
 def w2_empty_name_address_fields():
-    return {"First Name": "", "Last Name": "", "Suffix": "",
+    return {"First Name": "", "Middle Name": "", "Last Name": "", "Suffix": "",
             "Street Address": "", "City": "", "State": "", "Zip Code": ""}
 
 
@@ -342,16 +349,16 @@ def _w2_find_name_address_combined_box(plain_lines, caption_idx, page_num, colum
               f"empty (safe to share): {shape}")
         return w2_empty_name_address_fields()
 
-    first, last, suffix = w2_split_name_by_whitespace(block[0])
+    first, middle, last, suffix = w2_split_name_by_whitespace(block[0])
     fields = w2_split_address_block(block, 1, page_num, column_label)
-    fields.update({"First Name": first, "Last Name": last, "Suffix": suffix})
+    fields.update({"First Name": first, "Middle Name": middle, "Last Name": last, "Suffix": suffix})
     return fields
 
 
 def _w2_find_name_address_separate_boxes(lines, plain_lines, name_idx, page_num, column_label):
     last_x0, suff_x0, static_boundary = w2_find_e_box_dimensions(lines[name_idx])
 
-    first = last = suffix = ""
+    first = middle = last = suffix = ""
     plain_block = []
     name_row_used = False
     for j in range(name_idx + 1, min(name_idx + 40, len(plain_lines))):
@@ -366,7 +373,7 @@ def _w2_find_name_address_separate_boxes(lines, plain_lines, name_idx, page_num,
         if not (w2_is_letterish(text) or W2_CITY_STATE_ZIP_RE.match(text)):
             continue
         if not name_row_used:
-            first, last, suffix = w2_split_name_row(lines[j], last_x0, suff_x0, row_boundary)
+            first, middle, last, suffix = w2_split_name_row(lines[j], last_x0, suff_x0, row_boundary)
             name_row_used = True
         else:
             plain_block.append(text)
@@ -377,7 +384,7 @@ def _w2_find_name_address_separate_boxes(lines, plain_lines, name_idx, page_num,
         return w2_empty_name_address_fields()
 
     fields = w2_split_address_block(plain_block, 0, page_num, column_label)
-    fields.update({"First Name": first, "Last Name": last, "Suffix": suffix})
+    fields.update({"First Name": first, "Middle Name": middle, "Last Name": last, "Suffix": suffix})
     return fields
 
 
@@ -454,9 +461,9 @@ def w2_find_name_address_by_shape(plain_lines, page_num, column_label):
     name = plain_lines[chosen[0]].strip()
     csz_line = plain_lines[chosen[-1]].strip()
     m = W2_CITY_STATE_ZIP_RE.match(csz_line)
-    first, last, suffix = w2_split_name_by_whitespace(name)
+    first, middle, last, suffix = w2_split_name_by_whitespace(name)
     return {
-        "First Name": first, "Last Name": last, "Suffix": suffix,
+        "First Name": first, "Middle Name": middle, "Last Name": last, "Suffix": suffix,
         "Street Address": " ".join(plain_lines[i].strip() for i in chosen[1:-1]),
         "City": m.group("city").rstrip(","), "State": m.group("state"), "Zip Code": m.group("zip"),
     }
@@ -666,7 +673,7 @@ def w2_dedupe_records(records):
     deduped = []
     for rec in records:
         ssn = rec.get("SSN", "")
-        name_addr = (rec.get("First Name", ""), rec.get("Last Name", ""), rec.get("Suffix", ""),
+        name_addr = (rec.get("First Name", ""), rec.get("Middle Name", ""), rec.get("Last Name", ""), rec.get("Suffix", ""),
                      rec.get("Street Address", ""), rec.get("City", ""), rec.get("State", ""),
                      rec.get("Zip Code", ""))
         if ssn:
@@ -1994,6 +2001,7 @@ def extract_w2_rows(pdf: Path) -> list:
     for r in recs:
         emp = employer_by_page.get(r.get("Page"), {})
         rows.append(_row(**{**emp, "Page Number": r.get("Page"), "First Name": r.get("First Name"),
+                            "Middle Name": r.get("Middle Name"),
                             "Last Name": r.get("Last Name"), "Suffix": r.get("Suffix"),
                             "Street Address": r.get("Street Address"), "City": r.get("City"),
                             "State": r.get("State"), "Zip Code": r.get("Zip Code"), "SSN": r.get("SSN"),
