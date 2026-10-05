@@ -24,7 +24,13 @@ VALUES ARE KEPT EXACTLY AS THE DOCUMENT PRINTS THEM
     the name columns, but the text itself is not altered.
     Every cell is stored as Excel Text, so Excel never strips leading zeros or
     reformats a number, date or SSN. A column is written only when it has a value
-    in that file. Unrecognised files are skipped and listed at the end.
+    in that file.
+
+LAST RESORT: ROWS / TABLES
+    A PDF that matches none of the document types above is not skipped: its tables are copied row by
+    row (Col_1, Col_2, ...) and pages without a table contribute their text lines ("Extracted Text"),
+    exactly as printed -- the old pdf_extractor.py behaviour. Use --no-fallback to turn this off, or
+    --format generic to force it. Scanned PDFs with no text layer are listed at the end instead.
 
 DEPENDENCIES
     pip install pymupdf pdfplumber pypdf openpyxl tqdm
@@ -3542,23 +3548,19 @@ def dedupe_rows(rows: list) -> list:
     return kept
 
 
-def write_pii_xlsx(rows: list, out_path: Path) -> None:
-    """Write rows to .xlsx with only the columns that have a value in at least one row (File Name always
-    first), kept in PII_COLUMNS order. Every cell is stored as Text ("@"), so Excel never strips leading
-    zeros or reformats numbers, dates or SSNs."""
-    columns = [c for c in PII_COLUMNS if c == "File Name" or any(row.get(c) for row in rows)]
+def _write_text_xlsx(headers: list, matrix: list, out_path: Path) -> None:
+    """Write a header row plus rows of strings; every cell is stored as Excel Text ("@")."""
     wb = openpyxl.Workbook()
     ws = wb.active
     ws.title = "Extracted"
     bold = Font(bold=True)
-    widths = [len(c) for c in columns]
-    for ci, col in enumerate(columns, start=1):
-        cell = ws.cell(row=1, column=ci, value=col)
+    widths = [len(h) for h in headers]
+    for ci, header in enumerate(headers, start=1):
+        cell = ws.cell(row=1, column=ci, value=header)
         cell.font = bold
         cell.number_format = "@"
-    for ri, row in enumerate(rows, start=2):
-        for ci, col in enumerate(columns, start=1):
-            text = str(row.get(col, ""))
+    for ri, values in enumerate(matrix, start=2):
+        for ci, text in enumerate(values, start=1):
             cell = ws.cell(row=ri, column=ci, value=text)
             cell.data_type = "s"  # never a formula, even when the text starts with "=" or "-"
             cell.number_format = "@"
@@ -3571,6 +3573,61 @@ def write_pii_xlsx(rows: list, out_path: Path) -> None:
     wb.save(out_path)
 
 
+def write_pii_xlsx(rows: list, out_path: Path) -> None:
+    """Write rows with only the columns that have a value in at least one row (File Name always first),
+    kept in PII_COLUMNS order. Every cell is stored as Text, so Excel never strips leading zeros or
+    reformats numbers, dates or SSNs."""
+    columns = [c for c in PII_COLUMNS if c == "File Name" or any(row.get(c) for row in rows)]
+    _write_text_xlsx(columns, [[str(row.get(c, "")) for c in columns] for row in rows], out_path)
+
+
+# ===========================================================================
+# LAST-RESORT extractor -- rows / tables (ported from pdf_extractor.py)
+# Used only when no document type above matches. Table rows are copied cell by cell
+# (Col_1, Col_2, ...); pages without a table contribute their text lines. Values are
+# kept exactly as the document prints them.
+# ===========================================================================
+
+GENERIC_ILLEGAL_RE = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f]")
+
+
+def extract_generic_rows(pdf: Path):
+    """Return (headers, matrix): every table row on every page, plus the text lines of pages that have no
+    table. headers is File Name, Page Number, then Col_1..Col_n (or 'Extracted Text' when there are no
+    tables at all). Returns (None, []) when the PDF has neither tables nor a text layer."""
+    rows = []  # (page_number, cells)
+    has_tables = False
+    with pdfplumber.open(str(pdf)) as doc:
+        for page_num, page in enumerate(doc.pages, start=1):
+            try:
+                tables = page.extract_tables()
+            except Exception:
+                tables = []
+            page_has_rows = False
+            for table in tables:
+                for row in table:
+                    cells = [GENERIC_ILLEGAL_RE.sub("", str(c)).replace("\n", " ") if c is not None else ""
+                             for c in row]
+                    if any(c.strip() for c in cells):
+                        rows.append((page_num, cells))
+                        page_has_rows = has_tables = True
+            if not page_has_rows:  # no table on this page: keep its text lines as rows
+                try:
+                    text = page.extract_text(layout=True) or ""
+                except Exception:
+                    text = ""
+                for line in text.split("\n"):
+                    if line.strip():
+                        rows.append((page_num, [GENERIC_ILLEGAL_RE.sub("", line.rstrip())]))
+    if not rows:
+        return None, []
+    width = max(len(cells) for _, cells in rows)
+    headers = ["File Name", "Page Number"] + (
+        [f"Col_{i}" for i in range(1, width + 1)] if has_tables else ["Extracted Text"])
+    matrix = [[pdf.name, str(page_num)] + cells + [""] * (width - len(cells)) for page_num, cells in rows]
+    return headers, matrix
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(
         description="Extract PII/PHI values from PDFs of any supported type into one "
@@ -3579,8 +3636,11 @@ def main() -> int:
     parser.add_argument("-o", "--output-dir", default=None,
                         help="Folder for the <filename>_extracted.xlsx files (default: next to each PDF)")
     parser.add_argument("--recursive", action="store_true", help="Recurse into subfolders")
-    parser.add_argument("--format", default="auto", choices=["auto"] + FORMAT_PRIORITY,
-                        help="Force one document type for every file instead of auto-detecting")
+    parser.add_argument("--format", default="auto", choices=["auto", "generic"] + FORMAT_PRIORITY,
+                        help="Force one document type for every file instead of auto-detecting "
+                             "('generic' = rows/tables extraction only)")
+    parser.add_argument("--no-fallback", action="store_true",
+                        help="Do not use the rows/tables extractor for PDFs that match no document type")
     args = parser.parse_args()
 
     if not HAS_FITZ:
@@ -3601,9 +3661,28 @@ def main() -> int:
 
     unmatched, failed, written = [], [], 0
     for pdf in tqdm(pdf_files, desc="Extracting", unit="file"):
-        fmt = args.format if args.format != "auto" else detect_format_for_file(pdf, FORMAT_PRIORITY)
+        if args.format == "generic":
+            fmt = None
+        else:
+            fmt = args.format if args.format != "auto" else detect_format_for_file(pdf, FORMAT_PRIORITY)
         if fmt is None:
-            unmatched.append(pdf.name)
+            if args.format == "auto" and args.no_fallback:
+                unmatched.append(pdf.name)
+                continue
+            # last resort: no document type matched, so copy the rows / tables as they are
+            try:
+                headers, matrix = extract_generic_rows(pdf)
+            except Exception as exc:
+                failed.append(f"{pdf.name}: {exc}")
+                continue
+            if not matrix:
+                unmatched.append(pdf.name)  # no tables and no text layer (scanned)
+                continue
+            out_dir = Path(args.output_dir) if args.output_dir else pdf.parent
+            out_path = out_dir / f"{pdf.stem}_extracted.xlsx"
+            _write_text_xlsx(headers, matrix, out_path)
+            written += 1
+            print(f"  {pdf.name} -> [Rows/tables (last-resort)] {len(matrix)} row(s) -> {out_path.name}")
             continue
         try:
             rows = dedupe_rows([{"File Name": pdf.name, **r} for r in EXTRACTORS[fmt](pdf)])
@@ -3627,7 +3706,7 @@ def main() -> int:
         print("\nNo records extracted. No file written.")
 
     if unmatched:
-        print(f"\nNo supported document type detected ({len(unmatched)} file(s), skipped):")
+        print(f"\nNothing extracted -- no document type, tables or text found ({len(unmatched)} file(s), skipped):")
         for name in unmatched:
             print(f"  - {name}")
     if failed:
