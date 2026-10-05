@@ -3332,17 +3332,93 @@ def _row(**fields) -> dict:
     return finalize_row(out)
 
 
+def w2_column_of_label(lines, label_re):
+    """Find the caption row for a box and return (line index, x where the box column starts, x where the
+    next box on that row starts, index of the first word after the caption) -- or None."""
+    for li, ln in enumerate(lines):
+        words = [t for _, _, t in ln]
+        text = " ".join(words)
+        m = label_re.search(text)
+        if not m:
+            continue
+        starts, off = [], 0
+        for w in words:
+            starts.append(off)
+            off += len(w) + 1
+        wi = max(k for k in range(len(starts)) if starts[k] <= m.start())
+        end_wi = next((k for k in range(len(starts)) if starts[k] >= m.end()), len(words))
+        x_start = ln[wi][0]
+        if wi > 0 and re.fullmatch(r"[a-f]", words[wi - 1]):
+            x_start = ln[wi - 1][0]
+        x_end = float("inf")
+        for k in range(end_wi, len(words) - 1):
+            if W2_BOX_NUMBER_RE.match(words[k]) and words[k + 1][:1].isalpha():
+                x_end = ln[k][0]
+                break
+        return li, x_start, x_end, end_wi
+    return None
+
+
+def w2_employer_from_lines(lines) -> dict:
+    """Employer EIN, name and address from the 'b' and 'c' boxes, reading only the words inside each box's
+    own column (boxes sit side by side, so whole text rows mix in the neighbouring boxes)."""
+    out = {}
+    pos = w2_column_of_label(lines, re.compile(r"employer identification number", re.IGNORECASE))
+    if pos:
+        li, xs, xe, ewi = pos
+        candidates = [w for w in lines[li][ewi:] if w[0] < xe]
+        for below in lines[li + 1: li + 3]:
+            candidates += [w for w in below if xs - 6 <= w[0] < xe]
+        ein = next((t for _, _, t in candidates if re.fullmatch(r"\d{2}-\d{7}", t)), "")
+        if ein:
+            out["Employer TIN"] = ein
+    pos = w2_column_of_label(lines, re.compile(r"employer.s name, address", re.IGNORECASE))
+    if pos:
+        li, xs, xe, _ = pos
+        block = []
+        for below in lines[li + 1: li + 10]:
+            col = [w for w in below if xs - 6 <= w[0] < xe]
+            if not col:
+                continue
+            text = normalize_text(" ".join(t for _, _, t in col))
+            if re.match(r"^[a-f]\s+[A-Z]", text) or w2_find_right_column_boundary_strict(col) == col[0][0]:
+                break  # the next box's caption ("d Control number", "e Employee's name ...")
+            if LBL_SKIP_CAPTION_RE.search(text):
+                continue
+            block.append(text)
+            if len(block) == 5:
+                break
+        parsed = parse_name_address_block(block)
+        if parsed.get("Full Name"):
+            out["Employer Name"] = parsed["Full Name"]
+            addr = format_address(parsed.get("Street Address"), parsed.get("City"), parsed.get("State"),
+                                  parsed.get("Zip Code"))
+            if addr:
+                out["Employer Address"] = addr
+    return out
+
+
 def extract_w2_rows(pdf: Path) -> list:
     employer_by_page = {}
-    for page_num, text in page_texts(pdf):
-        emp = label_extract_record(text, W2_EMPLOYER_FIELDS)
-        blk = parse_name_address_block(label_extract_block(text, W2_EMPLOYER_BLOCK))
-        if blk.get("Full Name"):
-            emp["Employer Name"] = blk["Full Name"]
-            addr = format_address(blk.get("Street Address"), blk.get("City"), blk.get("State"), blk.get("Zip Code"))
-            if addr:
-                emp["Employer Address"] = addr
-        employer_by_page[page_num] = emp
+    doc = fitz.open(pdf)
+    try:
+        for page_num, page in enumerate(doc, start=1):
+            text = page.get_text()
+            emp = label_extract_record(text, W2_EMPLOYER_FIELDS)
+            blk = parse_name_address_block(label_extract_block(text, W2_EMPLOYER_BLOCK))
+            if blk.get("Full Name"):
+                emp["Employer Name"] = blk["Full Name"]
+                addr = format_address(blk.get("Street Address"), blk.get("City"), blk.get("State"), blk.get("Zip Code"))
+                if addr:
+                    emp["Employer Address"] = addr
+            if not (emp.get("Employer Name") and emp.get("Employer TIN")):
+                by_position = w2_employer_from_lines(group_words_into_lines(page.get_text("words")))
+                for key, value in by_position.items():
+                    if value and not emp.get(key):
+                        emp[key] = value
+            employer_by_page[page_num] = emp
+    finally:
+        doc.close()
     recs = w2_dedupe_records(w2_process_pdf(pdf, 0.5, True))
     rows = []
     for r in recs:
