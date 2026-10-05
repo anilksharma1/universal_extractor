@@ -26,6 +26,14 @@ VALUES ARE KEPT EXACTLY AS THE DOCUMENT PRINTS THEM
     reformats a number, date or SSN. A column is written only when it has a value
     in that file.
 
+OVERLAP WITH THE TABLE ENGINE (--compare-engines, opt-in)
+    For payroll changes, Gross-To-Net, 401k and paystub PDFs: if the PDF carries the identifier "ADP" the
+    dedicated extractor is used (priority rule). Otherwise the PDF is also run through
+    PDFWithTableConvertToExcelTool/doc_reader_v2.py and the engine that extracts more is kept; Azure OpenAI
+    judges, shown column names and counts only (never values), and the larger value count decides when it is
+    unavailable. The reason is written to the summary's "Detection Note" column. This sends those PDFs to your
+    Azure tenant, so it is off by default; claims / patient-info are never sent.
+
 RUN SUMMARY
     Each run also writes "<yymmdd> AS extraction summary.xlsx" (next to the input, or in -o): one row per
     document with file name, document type, pages, time taken, records, extracted columns, status and
@@ -3913,8 +3921,157 @@ def extract_ai_rows(pdf: Path):
     return headers, matrix
 
 
+# ===========================================================================
+# Overlap rule (--compare-engines): dedicated extractor vs the table engine
+# (PDFWithTableConvertToExcelTool/doc_reader_v2.py: Azure Document Intelligence + Azure OpenAI)
+#   1. A PDF that carries the identifier "ADP" goes to the dedicated extractor first.
+#   2. Otherwise both run and the one that extracts more is kept. The judge is Azure OpenAI, shown ONLY
+#      column names and counts (never values); without it, the larger value count wins.
+# Applies to the four document types both engines cover. Claims / patient-info are never sent anywhere.
+# ===========================================================================
+
+ARBITRATE_FORMATS = {"bucket11", "gross-pay", "401k", "adp-paystub"}
+ADP_IDENTIFIER_RE = re.compile(r"\bADP\b|(?i:Automatic Data Processing)")
+_ENGINE_STATE = {}
+
+
+def has_adp_identifier(pdf: Path, max_pages: int = 10) -> bool:
+    """True when 'ADP' (or 'Automatic Data Processing') is printed on any of the first pages."""
+    try:
+        with fitz.open(pdf) as doc:
+            for i, page in enumerate(doc):
+                if i >= max_pages:
+                    break
+                if ADP_IDENTIFIER_RE.search(page.get_text()):
+                    return True
+    except Exception:
+        pass
+    return False
+
+
+def rows_stats(rows: list) -> dict:
+    skip = ("File Name", "Page Number")
+    columns = [c for c in PII_COLUMNS if c not in skip and any(r.get(c) for r in rows)]
+    values = sum(1 for r in rows for c in PII_COLUMNS if c not in skip and r.get(c))
+    return {"values": values, "columns": columns, "records": len(rows)}
+
+
+def tables_stats(tables: list) -> dict:
+    """tables: [(sheet name, matrix of strings)]; the first row of each matrix is its header."""
+    values, records, columns = 0, 0, []
+    for _name, matrix in tables:
+        if not matrix:
+            continue
+        for header in matrix[0]:
+            header = str(header).strip()
+            if header and header not in columns:
+                columns.append(header)
+        values += sum(1 for row in matrix[1:] for cell in row if str(cell).strip())
+        records += max(len(matrix) - 1, 0)
+    return {"values": values, "columns": columns, "records": records}
+
+
+def run_table_engine(pdf: Path):
+    """Run the table engine on one PDF in a temp folder. Returns (tables, why): tables is a list of
+    (sheet name, matrix) -- possibly empty -- or None with the reason it could not run."""
+    import importlib.util
+    path = Path(os.environ.get("TABLE_ENGINE_PATH") or Path(__file__).resolve().parent
+                / "PDFWithTableConvertToExcelTool" / "doc_reader_v2.py")
+    if not path.is_file():
+        return None, f"engine file not found: {path.name}"
+    try:
+        if "module" not in _ENGINE_STATE:
+            spec = importlib.util.spec_from_file_location("doc_reader_v2_engine", path)
+            module = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(module)
+            _ENGINE_STATE["module"] = module
+            _ENGINE_STATE["di"] = module._get_di_client()
+            _ENGINE_STATE["openai"], _ENGINE_STATE["deployment"] = module._get_openai_client()
+        module = _ENGINE_STATE["module"]
+        with tempfile.TemporaryDirectory() as tmp:
+            out_dir = Path(tmp) / "out"
+            module.process_pdf(_ENGINE_STATE["di"], _ENGINE_STATE["openai"], _ENGINE_STATE["deployment"],
+                               pdf, out_dir, 200, False)
+            tables = []
+            for xlsx in sorted((out_dir / "tabular data").glob(f"{pdf.stem}_intermediate*.xlsx")):
+                wb = openpyxl.load_workbook(xlsx, read_only=True, data_only=True)
+                for ws in wb.worksheets:
+                    if ws.title.lower().startswith("reviewer note"):
+                        continue
+                    matrix = [["" if v is None else str(v) for v in row] for row in ws.iter_rows(values_only=True)]
+                    matrix = [row for row in matrix if any(c.strip() for c in row)]
+                    if matrix:
+                        tables.append((ws.title, matrix))
+                wb.close()
+            return tables, ""
+    except Exception as exc:
+        return None, f"{type(exc).__name__}: {str(exc)[:120]}"
+
+
+def judge_engines(uni: dict, eng: dict):
+    """Return (winner, how): 'universal' or 'engine'. The AI judge sees column names and counts only."""
+    if eng["values"] == 0:
+        return "universal", "table engine extracted nothing"
+    if uni["values"] == 0:
+        return "engine", "dedicated extractor extracted nothing"
+    try:
+        client, deployment = ai_client()
+        facts = {
+            "extractor_A_dedicated": {"values_extracted": uni["values"], "records": uni["records"],
+                                      "columns": [_ai_neutralize(c)[:60] for c in uni["columns"][:40]]},
+            "extractor_B_table_engine": {"values_extracted": eng["values"], "records": eng["records"],
+                                         "columns": [_ai_neutralize(c)[:60] for c in eng["columns"][:40]]},
+        }
+        messages = [
+            {"role": "system", "content": "Two extractors processed the same payroll document. Decide which one "
+             "extracted more useful information (more distinct, meaningful fields and more values). You are given "
+             "counts and column names only. Reply as JSON: {\"winner\": \"A\" or \"B\", \"reason\": \"<=20 words\"}."},
+            {"role": "user", "content": json.dumps(facts)},
+        ]
+        response = client.chat.completions.create(model=deployment, temperature=1,
+                                                  response_format={"type": "json_object"}, messages=messages)
+        data = json.loads(response.choices[0].message.content)
+        winner = {"A": "universal", "B": "engine"}.get(str(data.get("winner", "")).strip().upper())
+        if winner:
+            return winner, "AI judge: " + str(data.get("reason", ""))[:120]
+    except Exception:
+        pass  # AI not configured or failed: fall back to the plain count below
+    if eng["values"] > uni["values"]:
+        return "engine", "more values (count)"
+    return "universal", "equal or more values (count)"
+
+
+def arbitrate_engines(pdf: Path, fmt: str, rows: list) -> dict:
+    if has_adp_identifier(pdf):
+        return {"use": "universal",
+                "note": f"ADP identifier found in the PDF -> dedicated {FORMAT_LABELS[fmt]} extractor (priority rule)"}
+    tables, why = run_table_engine(pdf)
+    if tables is None:
+        return {"use": "universal", "note": f"No ADP identifier; table engine unavailable ({why}) -> dedicated extractor"}
+    uni, eng = rows_stats(rows), tables_stats(tables)
+    winner, how = judge_engines(uni, eng)
+    return {"use": winner, "tables": tables, "stats": eng,
+            "note": (f"No ADP identifier; compared: dedicated {uni['values']} values / {len(uni['columns'])} columns "
+                     f"vs table engine {eng['values']} values / {len(eng['columns'])} columns -> {winner} ({how})")}
+
+
+def _write_tables_xlsx(tables: list, out_path: Path) -> list:
+    """One sheet per table, every cell Text. Returns the first table's header names."""
+    wb = openpyxl.Workbook()
+    wb.remove(wb.active)
+    for i, (name, matrix) in enumerate(tables, start=1):
+        ws = wb.create_sheet(re.sub(r"[\[\]*?/\\:]", "_", name or f"Table_{i}")[:31])
+        for ri, row in enumerate(matrix, start=1):
+            for ci, text in enumerate(row, start=1):
+                cell = ws.cell(row=ri, column=ci, value=GENERIC_ILLEGAL_RE.sub("", str(text)))
+                cell.data_type, cell.number_format = "s", "@"
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    wb.save(out_path)
+    return [str(h) for h in tables[0][1][0] if str(h).strip()] if tables else []
+
+
 SUMMARY_HEADERS = ["File Name", "Document Type", "Pages", "Time Taken (s)", "Records", "Extracted Columns",
-                   "Status", "Output File", "Reason Not Extracted"]
+                   "Status", "Output File", "Detection Note", "Reason Not Extracted"]
 
 
 _TESSERACT_OK = None
@@ -3993,6 +4150,11 @@ def main() -> int:
                              "type (page text + page image are sent to your Azure OpenAI deployment; claims / "
                              "patient-info documents are never sent). Needs AZURE_OPENAI_ENDPOINT and "
                              "AZURE_OPENAI_DEPLOYMENT.")
+    parser.add_argument("--compare-engines", action="store_true",
+                        help="For the 4 types the table engine also covers (payroll changes, Gross-To-Net, 401k, "
+                             "paystub): PDFs carrying 'ADP' use the dedicated extractor; others are also run through "
+                             "PDFWithTableConvertToExcelTool/doc_reader_v2.py (Azure Document Intelligence + Azure "
+                             "OpenAI) and the engine that extracts more is kept. Sends those PDFs to your Azure tenant.")
     args = parser.parse_args()
 
     if not HAS_FITZ:
@@ -4014,6 +4176,11 @@ def main() -> int:
         print("AI is ON: for PDFs that match no document type, page text and page images are sent to your "
               "Azure OpenAI deployment. Claims / patient-info documents are never sent.")
 
+    if args.compare_engines:
+        print("COMPARE-ENGINES is ON: payroll-changes / Gross-To-Net / 401k / paystub PDFs WITHOUT an 'ADP' "
+              "identifier are also sent to Azure Document Intelligence / Azure OpenAI (your tenant). "
+              "Claims / patient-info are never sent.")
+
     input_path = Path(args.input)
     if not input_path.exists():
         sys.exit(f"ERROR: path not found -- {input_path}")
@@ -4027,7 +4194,8 @@ def main() -> int:
     for pdf in tqdm(pdf_files, desc="Extracting", unit="file"):
         t0 = time.perf_counter()
         entry = {"File Name": pdf.name, "Pages": pdf_page_count(pdf), "Records": "0", "Extracted Columns": "",
-                 "Status": "Not extracted", "Output File": "", "Reason Not Extracted": "", "Document Type": ""}
+                 "Status": "Not extracted", "Output File": "", "Reason Not Extracted": "", "Document Type": "",
+                 "Detection Note": ""}
 
         def finish(**fields):
             entry.update(fields)
@@ -4111,6 +4279,18 @@ def main() -> int:
                 finish(**{"Document Type": FORMAT_LABELS[fmt],
                           "Reason Not Extracted": "Document type recognised but no records could be read from it, and no tables or text rows were found either"})
             continue
+        if args.compare_engines and args.format == "auto" and fmt in ARBITRATE_FORMATS:
+            decision = arbitrate_engines(pdf, fmt, rows)
+            entry["Detection Note"] = decision["note"]
+            print(f"  {pdf.name}: {decision['note']}")
+            if decision["use"] == "engine":
+                columns = _write_tables_xlsx(decision["tables"], out_path)
+                written += 1
+                print(f"  {pdf.name} -> [Table engine] {decision['stats']['records']} row(s) -> {out_path.name}")
+                finish(**{"Document Type": f"Table engine ({FORMAT_LABELS[fmt]} overlap)",
+                          "Records": str(decision["stats"]["records"]), "Extracted Columns": ", ".join(columns),
+                          "Status": "Extracted", "Output File": out_path.name})
+                continue
         columns = write_pii_xlsx(rows, out_path)
         written += 1
         print(f"  {pdf.name} -> [{FORMAT_LABELS[fmt]}] {len(rows)} record(s) -> {out_path.name}")
